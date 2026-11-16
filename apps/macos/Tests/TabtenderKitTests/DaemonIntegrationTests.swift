@@ -198,7 +198,9 @@ final class DaemonIntegrationTests: DaemonTestCase {
         XCTAssertTrue(created.headless)
         XCTAssertNil(created.profile)
         XCTAssertEqual(created.connectedClients, 0)
-        XCTAssertEqual(created.expiresAt.timeIntervalSince(created.createdAt), 120, accuracy: 2)
+        // The TTL starts once the browser is ready, so the launch time is on top of it.
+        let lifetime = created.expiresAt.timeIntervalSince(created.createdAt)
+        XCTAssertTrue((120...210).contains(lifetime), "lifetime \(lifetime)")
         XCTAssertEqual(created.cdpUrl, "ws://127.0.0.1:\(daemon.port)/v1/sessions/\(created.id)/cdp")
 
         let listed = try await daemon.client.sessions()

@@ -3,7 +3,6 @@ version: "2"
 linters:
   default: standard
   enable:
-    - bodyclose
     - misspell
     - unconvert
   exclusions:
@@ -12,7 +11,6 @@ linters:
       - path: _test\.go
         linters:
           - errcheck
-          - bodyclose
 
 formatters:
   enable:

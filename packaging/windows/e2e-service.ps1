@@ -133,7 +133,8 @@ sessions:
     $created = Invoke-Api -Method POST -Url "$url/v1/sessions" -Key $adminKey -Body '{}'
     Assert ($created.Status -eq 201) "create session returned $($created.Status)"
     $ttl = ([datetime]$created.Json.expiresAt - [datetime]$created.Json.createdAt).TotalSeconds
-    Assert ([math]::Abs($ttl - 777) -lt 5) "session TTL is $ttl, want the file-configured 777"
+    # The TTL starts once the browser is ready, so launch time comes on top.
+    Assert ($ttl -ge 776 -and $ttl -lt 870) "session lifetime is $ttl, want the file-configured 777 plus launch time"
     $second = Invoke-Api -Method POST -Url "$url/v1/sessions" -Key $adminKey -Body '{}'
     Assert ($second.Status -eq 429) "a second session returned $($second.Status), want 429"
 
