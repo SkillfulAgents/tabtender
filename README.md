@@ -236,7 +236,8 @@ Set `tunnel.provider` (or pick it in the macOS app):
 
 - **`cloudflare-quick`** — a temporary `https://<random>.trycloudflare.com`
   URL. No account needed; intended for development. The URL changes whenever
-  the tunnel restarts, and a new hostname can take up to a minute to resolve.
+  the tunnel restarts, and a new hostname can take up to a minute to resolve
+  and route (Cloudflare answers `530` until then).
 - **`cloudflare-named`** — a persistent tunnel. Create a tunnel in the
   Cloudflare dashboard, route a public hostname to `http://localhost:3000`,
   set `tunnel.cloudflare.hostname`, and provide the tunnel token (macOS app →

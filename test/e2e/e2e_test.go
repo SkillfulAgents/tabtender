@@ -624,9 +624,25 @@ func TestQuickTunnelEndToEnd(t *testing.T) {
 	// DNS-over-HTTPS and pin the address instead.
 	client := pinnedClient(t, public.Hostname())
 
-	if res := doRequest(t, client, http.MethodGet, public.String()+"/v1/health", "", ""); res.status != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated request through the tunnel: %d %s", res.status, res.body)
-	}
+	// Right after a tunnel registers, Cloudflare's edge can answer 530 for a
+	// few seconds until routing has propagated. Once it routes, the very
+	// first thing an unauthenticated caller must see is our 401.
+	eventually(t, 3*time.Minute, "the Cloudflare edge to route to the tunnel", func() bool {
+		req, _ := http.NewRequest(http.MethodGet, public.String()+"/v1/health", nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close() //nolint:errcheck // test
+		if resp.StatusCode >= 500 {
+			time.Sleep(2 * time.Second)
+			return false
+		}
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("unauthenticated request through the tunnel: %d", resp.StatusCode)
+		}
+		return true
+	})
 	if res := doRequest(t, client, http.MethodGet, public.String()+"/v1/health", "wrong", ""); res.status != http.StatusUnauthorized {
 		t.Fatalf("wrong key through the tunnel: %d", res.status)
 	}
