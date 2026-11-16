@@ -1,0 +1,20 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Swift / Xcode
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+
+# Node
+node_modules/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

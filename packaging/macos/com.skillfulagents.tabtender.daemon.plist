@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Per-user LaunchAgent for tabtenderd, registered by Tabtender.app
+	     through SMAppService. launchd owns and supervises the process. -->
+	<key>Label</key>
+	<string>com.skillfulagents.tabtender.daemon</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/tabtenderd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>tabtenderd</string>
+		<string>run</string>
+		<string>--launchd</string>
+	</array>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>com.skillfulagents.tabtender</string>
+	</array>
+	<!-- Start at login; tabtenderd itself exits right away when
+	     app.startOnLogin is disabled. -->
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Restart after crashes, but stay down after a clean stop. -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<!-- Headed Chrome needs the user's graphical session. -->
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<!-- Give sessions time to shut their browsers down cleanly. -->
+	<key>ExitTimeOut</key>
+	<integer>60</integer>
+</dict>
+</plist>

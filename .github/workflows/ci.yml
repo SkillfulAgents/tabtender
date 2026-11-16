@@ -1,0 +1,177 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: Module files are tidy
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+      - name: Vet (all release platforms)
+        run: |
+          for os in linux darwin windows; do
+            echo "== $os"
+            GOOS=$os go vet -tags e2e ./...
+          done
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+            binary: bin/tabtenderd
+            headed: "1"
+            platform_secrets: "1"
+          - name: Windows
+            os: windows-latest
+            binary: bin/tabtenderd.exe
+            headed: "1"
+            platform_secrets: "1"
+          - name: Linux
+            os: ubuntu-latest
+            binary: bin/tabtenderd
+            # No display on the runner, and its AppArmor profile blocks the
+            # Chrome sandbox.
+            headless: "true"
+            chrome_args: "--no-sandbox"
+    env:
+      TABTENDER_E2E_HEADED: ${{ matrix.headed }}
+      TABTENDER_E2E_CHROME_ARGS: ${{ matrix.chrome_args }}
+      TABTENDER_HEADLESS: ${{ matrix.headless }}
+      TABTENDER_TEST_PLATFORM_SECRETS: ${{ matrix.platform_secrets }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Unit tests
+        run: go test -race -count=1 ./...
+      - name: End-to-end tests (real tabtenderd, real Chrome, real Cloudflare tunnel)
+        env:
+          TABTENDER_E2E_TUNNEL: "1"
+        run: go test -tags e2e -count=1 -timeout 30m -v ./test/e2e/
+      - name: Build tabtenderd
+        run: go build -o ${{ matrix.binary }} ./cmd/tabtenderd
+      - name: Client conformance (Playwright and Puppeteer)
+        working-directory: test/clients
+        run: |
+          npm ci
+          node run.mjs ../../${{ matrix.binary }}
+
+  macos-app:
+    name: macOS app (launchd service lifecycle)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build Tabtender.app and DMG (universal)
+        run: packaging/macos/build-app.sh --dmg
+      - name: Swift tests against the real daemon
+        working-directory: apps/macos
+        run: TABTENDERD_PATH="$GITHUB_WORKSPACE/dist/Tabtender.app/Contents/MacOS/tabtenderd" swift test
+      - name: Install client test dependencies
+        working-directory: test/clients
+        run: npm ci
+      - name: Service lifecycle through SMAppService and launchd
+        run: packaging/macos/e2e-launchd.sh dist/Tabtender.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tabtender-macos
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  windows-service:
+    name: Windows service (SCM lifecycle)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build and package tabtenderd.exe
+        shell: pwsh
+        run: |
+          $version = (git describe --tags --always).TrimStart('v')
+          $ldflags = "-s -w -X github.com/SkillfulAgents/tabtender/internal/version.Version=$version"
+          foreach ($arch in 'amd64', 'arm64') {
+            $dir = "dist/tabtender-windows-$arch"
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            $env:GOARCH = $arch
+            go build -trimpath -ldflags $ldflags -o "$dir/tabtenderd.exe" ./cmd/tabtenderd
+            if ($LASTEXITCODE -ne 0) { throw "build failed for $arch" }
+            Copy-Item packaging/windows/install.ps1, packaging/windows/uninstall.ps1, LICENSE -Destination $dir
+            Compress-Archive -Path "$dir/*" -DestinationPath "dist/tabtender-$version-windows-$arch.zip"
+          }
+      - name: Install client test dependencies
+        working-directory: test/clients
+        run: npm ci
+      - name: Service lifecycle through the Service Control Manager
+        shell: pwsh
+        run: packaging/windows/e2e-service.ps1 -BinaryPath dist/tabtender-windows-amd64/tabtenderd.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tabtender-windows
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, test, macos-app, windows-service]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag

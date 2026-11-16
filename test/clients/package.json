@@ -1,0 +1,13 @@
+{
+  "name": "tabtender-client-conformance",
+  "private": true,
+  "type": "module",
+  "description": "Drives a running tabtenderd with real CDP client libraries (Playwright, Puppeteer).",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 --test-timeout=180000"
+  },
+  "dependencies": {
+    "playwright-core": "^1.50.0",
+    "puppeteer-core": "^24.0.0"
+  }
+}

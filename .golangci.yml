@@ -1,0 +1,19 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - misspell
+    - unconvert
+  exclusions:
+    rules:
+      # Tests favor brevity over exhaustive error handling in cleanup paths.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose
+
+formatters:
+  enable:
+    - gofmt

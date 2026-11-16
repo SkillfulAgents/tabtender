@@ -1,0 +1,153 @@
+import XCTest
+@testable import TabtenderKit
+
+/// Records every service operation in order, across both fakes.
+private final class Recorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [String] = []
+
+    func record(_ entry: String) {
+        lock.lock()
+        entries.append(entry)
+        lock.unlock()
+    }
+
+    var log: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries
+    }
+}
+
+private struct FakeRunner: CommandRunner {
+    let recorder: Recorder
+    /// Exit codes by executable name; anything else succeeds.
+    var exitCodes: [String: Int32] = [:]
+
+    func run(_ executable: URL, arguments: [String]) throws -> CommandResult {
+        recorder.record(([executable.path] + arguments).joined(separator: " "))
+        return CommandResult(exitCode: exitCodes[executable.lastPathComponent] ?? 0, output: "fake output")
+    }
+}
+
+private struct FakeRegistration: ServiceRegistration {
+    let recorder: Recorder
+    var status: ServiceRegistrationStatus = .notRegistered
+
+    func register() throws { recorder.record("register") }
+    func unregister() throws { recorder.record("unregister") }
+}
+
+final class ServiceControllerTests: XCTestCase {
+    private let recorder = Recorder()
+    private let daemon = URL(fileURLWithPath: "/Applications/Tabtender.app/Contents/MacOS/tabtenderd")
+    private let target = "gui/501/com.skillfulagents.tabtender.daemon"
+
+    private func controller(
+        exitCodes: [String: Int32] = [:],
+        daemonURL: URL?? = nil,
+        status: ServiceRegistrationStatus = .notRegistered,
+        processExists: @escaping @Sendable (pid_t) -> Bool = { _ in false }
+    ) -> ServiceController {
+        ServiceController(
+            registration: FakeRegistration(recorder: recorder, status: status),
+            runner: FakeRunner(recorder: recorder, exitCodes: exitCodes),
+            daemonURL: daemonURL ?? daemon,
+            userID: 501,
+            processExists: processExists
+        )
+    }
+
+    func testIdentifiers() {
+        XCTAssertEqual(ServiceController.label, "com.skillfulagents.tabtender.daemon")
+        XCTAssertEqual(ServiceController.plistName, "com.skillfulagents.tabtender.daemon.plist")
+        XCTAssertEqual(controller().serviceTarget, target)
+    }
+
+    func testStartRequestsStartThenKickstarts() throws {
+        try controller().start()
+        XCTAssertEqual(recorder.log, [
+            "\(daemon.path) service request-start",
+            "/bin/launchctl kickstart \(target)",
+        ])
+    }
+
+    func testStartDoesNotKickstartWhenRequestStartFails() {
+        XCTAssertThrowsError(try controller(exitCodes: ["tabtenderd": 1]).start()) { error in
+            XCTAssertEqual(error as? ServiceError, .commandFailed(
+                command: "tabtenderd service request-start", exitCode: 1, output: "fake output"
+            ))
+        }
+        XCTAssertEqual(recorder.log, ["\(daemon.path) service request-start"])
+    }
+
+    func testStartFailsWithoutDaemon() {
+        XCTAssertThrowsError(try controller(daemonURL: .some(nil)).start()) { error in
+            XCTAssertEqual(error as? ServiceError, .daemonNotFound)
+        }
+        XCTAssertEqual(recorder.log, [])
+    }
+
+    func testStopSendsSIGTERMThroughLaunchctl() throws {
+        try controller().stop()
+        XCTAssertEqual(recorder.log, ["/bin/launchctl kill SIGTERM \(target)"])
+    }
+
+    func testLaunchctlFailureIsReported() {
+        XCTAssertThrowsError(try controller(exitCodes: ["launchctl": 113]).stop()) { error in
+            XCTAssertEqual(error as? ServiceError, .commandFailed(
+                command: "launchctl kill SIGTERM \(target)", exitCode: 113, output: "fake output"
+            ))
+            XCTAssertEqual(
+                error.localizedDescription,
+                "launchctl kill SIGTERM \(target) failed with exit code 113: fake output"
+            )
+        }
+    }
+
+    func testRegisterRequestsStartBeforeRegistering() throws {
+        try controller().register()
+        XCTAssertEqual(recorder.log, ["\(daemon.path) service request-start", "register"])
+    }
+
+    func testUnregisterOnlyUnregisters() throws {
+        try controller().unregister()
+        XCTAssertEqual(recorder.log, ["unregister"])
+    }
+
+    func testReportsRegistrationStatus() {
+        XCTAssertEqual(controller(status: .requiresApproval).registrationStatus, .requiresApproval)
+    }
+
+    func testWaitForExitReturnsOncePidIsGone() async {
+        let checks = Recorder()
+        let controller = controller(processExists: { pid in
+            checks.record("\(pid)")
+            return checks.log.count < 3
+        })
+        let exited = await controller.waitForExit(of: 4242, timeout: 5)
+        XCTAssertTrue(exited)
+        XCTAssertEqual(checks.log, ["4242", "4242", "4242"])
+    }
+
+    func testWaitForExitTimesOut() async {
+        let exited = await controller(processExists: { _ in true }).waitForExit(of: 4242, timeout: 0.3)
+        XCTAssertFalse(exited)
+    }
+
+    func testProcessCommandRunnerCapturesOutputAndExitCode() throws {
+        let result = try ProcessCommandRunner().run(
+            URL(fileURLWithPath: "/bin/sh"), arguments: ["-c", "echo out; echo err >&2; exit 3"]
+        )
+        XCTAssertEqual(result.exitCode, 3)
+        XCTAssertEqual(result.output, "out\nerr")
+    }
+
+    func testProcessCommandRunnerReportsMissingExecutable() {
+        XCTAssertThrowsError(try ProcessCommandRunner().run(URL(fileURLWithPath: "/nonexistent/tool"), arguments: [])) { error in
+            guard case ServiceError.launchFailed(executable: "/nonexistent/tool", reason: _) = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+        }
+    }
+}
