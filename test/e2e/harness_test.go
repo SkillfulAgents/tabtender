@@ -215,8 +215,28 @@ func (s *daemonSpec) start(t *testing.T) *daemon {
 	return d
 }
 
+// waitReady blocks until the daemon answers HTTP requests and, where the
+// platform has one, its management socket accepts connections.
 func (d *daemon) waitReady() {
 	d.t.Helper()
+	probe := &http.Client{Timeout: 2 * time.Second}
+	defer probe.CloseIdleConnections()
+	ready := func() bool {
+		resp, err := probe.Get(d.spec.baseURL() + "/v1/health")
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		if runtime.GOOS == "windows" {
+			return true
+		}
+		conn, err := net.DialTimeout("unix", d.spec.socketPath(), time.Second)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
+	}
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
@@ -224,9 +244,7 @@ func (d *daemon) waitReady() {
 			d.t.Fatalf("tabtenderd exited during startup: %v\n%s", d.exitErr, d.output.String())
 		default:
 		}
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", d.spec.port), time.Second)
-		if err == nil {
-			_ = conn.Close()
+		if ready() {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)

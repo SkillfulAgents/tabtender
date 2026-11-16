@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strconv"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -23,10 +24,19 @@ func KillTree(pid int) error {
 		return errors.New("refusing to kill invalid pid")
 	}
 	out, err := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).CombinedOutput()
-	if err != nil && Alive(pid) {
-		return fmt.Errorf("taskkill: %w: %s", err, out)
+	if err == nil {
+		return nil
 	}
-	return nil
+	// taskkill reports failure when any process of the tree could not be
+	// terminated, which routinely happens for helpers that exit on their own
+	// while the tree is being torn down. What matters is that the root is
+	// gone; give the OS a moment to finish tearing it down.
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if !Alive(pid) {
+			return nil
+		}
+	}
+	return fmt.Errorf("taskkill: %w: %s", err, out)
 }
 
 // ContainDescendants places the daemon in a job object configured to kill
