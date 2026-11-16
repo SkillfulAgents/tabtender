@@ -147,6 +147,10 @@ Errors look like `{"error": {"code": "validation_error", "message": "..."}}`:
 - A session lives until its TTL expires or it is deleted — **not** until its
   client disconnects. Clients may disconnect and reconnect freely; tabs,
   cookies, and storage stay as they were.
+- Ending a session shuts the browser down cleanly (falling back to a kill
+  after a grace period). As with any browser, state written in the last
+  instant before shutdown may not have reached the disk yet — give a named
+  profile a moment after your final write before deleting its session.
 - Sessions without a `profile` use an ephemeral profile that is deleted when
   the session ends. Named profiles persist on disk and are exclusively locked
   while in use.

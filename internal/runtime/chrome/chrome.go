@@ -35,10 +35,13 @@ const (
 	activePortFile = "DevToolsActivePort"
 
 	startupTimeout = 45 * time.Second
-	gracePeriod    = 5 * time.Second
-	killTimeout    = 10 * time.Second
-	pollInterval   = 25 * time.Millisecond
-	stderrTailSize = 4 << 10
+	// gracePeriod is how long a browser gets to exit by itself after being
+	// asked to, before its process tree is killed.
+	gracePeriod         = 10 * time.Second
+	closeRequestTimeout = 3 * time.Second
+	killTimeout         = 10 * time.Second
+	pollInterval        = 25 * time.Millisecond
+	stderrTailSize      = 4 << 10
 )
 
 // Runtime launches Chrome processes.
@@ -222,15 +225,30 @@ func waitFor(ctx context.Context, done <-chan struct{}, d time.Duration) bool {
 // loopbackClient never uses a proxy: CDP endpoints are always on loopback.
 var loopbackClient = &http.Client{Transport: &http.Transport{Proxy: nil}}
 
+// requestClose asks the browser to shut itself down and waits until it has
+// taken the request (it answers, or drops the connection as it exits), so
+// that the shutdown is orderly and profile data gets flushed.
 func requestClose(ctx context.Context, endpoint string) error {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, closeRequestTimeout)
 	defer cancel()
 	conn, _, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: loopbackClient})
 	if err != nil {
 		return err
 	}
 	defer conn.CloseNow() //nolint:errcheck // best effort
-	return conn.Write(ctx, websocket.MessageText, []byte(`{"id":1,"method":"Browser.close"}`))
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"id":1,"method":"Browser.close"}`)); err != nil {
+		return err
+	}
+	for {
+		_, reply, err := conn.Read(ctx)
+		if err != nil {
+			// The browser closing the connection is the expected outcome.
+			return nil
+		}
+		if bytes.Contains(reply, []byte(`"id":1`)) {
+			return nil
+		}
+	}
 }
 
 type instance struct {

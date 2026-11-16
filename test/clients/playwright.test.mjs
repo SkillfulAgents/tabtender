@@ -128,6 +128,9 @@ test('a named profile persists browsing state across sessions', async () => {
     const page = await browser.contexts()[0].newPage();
     await page.goto(site.url);
     await page.evaluate(() => localStorage.setItem('persisted', 'yes'));
+    // Like any browser, Chrome writes storage to disk asynchronously; a write
+    // made in the very last instant before shutdown can be lost.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
     await browser.close();
   } finally {
     await deleteSession(first.id);
