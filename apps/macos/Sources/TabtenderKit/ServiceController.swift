@@ -6,6 +6,10 @@ public enum ServiceError: Error, Equatable, Sendable {
     case daemonNotFound
     case launchFailed(executable: String, reason: String)
     case commandFailed(command: String, exitCode: Int32, output: String)
+    case timedOut(command: String)
+    /// The app runs from a disk image or a translocated path; see
+    /// `AppInstallation.temporaryLocation`.
+    case temporaryLocation
 }
 
 extension ServiceError: LocalizedError {
@@ -18,6 +22,10 @@ extension ServiceError: LocalizedError {
         case let .commandFailed(command, exitCode, output):
             let detail = output.isEmpty ? "" : ": \(output)"
             return "\(command) failed with exit code \(exitCode)\(detail)"
+        case let .timedOut(command):
+            return "\(command) did not finish in time."
+        case .temporaryLocation:
+            return "Move Tabtender to the Applications folder, then open it again."
         }
     }
 }
@@ -35,6 +43,9 @@ public struct ServiceController: Sendable {
 
     static let launchctlURL = URL(fileURLWithPath: "/bin/launchctl")
 
+    /// Whether the running app is somewhere its service can be registered from.
+    public let installation: AppInstallation
+
     private let registration: ServiceRegistration
     private let runner: CommandRunner
     private let daemonURL: URL?
@@ -48,12 +59,14 @@ public struct ServiceController: Sendable {
         registration: ServiceRegistration = LaunchAgentRegistration(),
         runner: CommandRunner = ProcessCommandRunner(),
         daemonURL: URL? = DaemonLocator.locate(),
+        installation: AppInstallation = .inspect(),
         userID: uid_t = getuid(),
         processExists: @escaping @Sendable (pid_t) -> Bool = { kill($0, 0) == 0 || errno == EPERM }
     ) {
         self.registration = registration
         self.runner = runner
         self.daemonURL = daemonURL
+        self.installation = installation
         self.userID = userID
         self.processExists = processExists
     }
@@ -72,20 +85,9 @@ public struct ServiceController: Sendable {
     /// A start request is recorded first so the daemon stays up even when
     /// `app.startOnLogin` is off.
     public func register() throws {
+        try requireRegistrableInstallation()
         try requestStart()
         try registration.register()
-    }
-
-    /// Replaces the registration with a fresh one, restarting the daemon.
-    ///
-    /// macOS ties a registered launch agent to the exact build of the app
-    /// that registered it. After the app is updated, launchd refuses to spawn
-    /// the new daemon ("spawn failed", exit 78) until it is registered again.
-    public func reregister(settleDelay: TimeInterval = 1) async throws {
-        // The old registration may already be gone; only the new one matters.
-        try? registration.unregister()
-        try? await Task.sleep(nanoseconds: UInt64(settleDelay * 1_000_000_000))
-        try register()
     }
 
     /// Registers the service and makes sure the daemon actually comes up,
@@ -95,15 +97,18 @@ public struct ServiceController: Sendable {
     /// location before; registering again resolves it.
     ///
     /// - Parameters:
-    ///   - isRunning: Reports whether the daemon is answering.
     ///   - startTimeout: How long each attempt waits for the daemon.
+    ///   - daemon: Identifies the daemon answering on the management socket,
+    ///     or returns `nil` when there is none.
     public func registerVerified(
         startTimeout: TimeInterval = 6,
         settleDelay: TimeInterval = 1,
-        isRunning: @Sendable () async -> Bool
+        exitTimeout: TimeInterval = 65,
+        daemon: @Sendable () async -> DaemonIdentity?
     ) async throws -> Bool {
+        let previous = await daemon()?.pid
         try register()
-        if await waitUntilRunning(isRunning, timeout: startTimeout) {
+        if await waitForDaemon(daemon, otherThan: previous, timeout: startTimeout) {
             return true
         }
         guard registrationStatus == .enabled else {
@@ -111,39 +116,87 @@ public struct ServiceController: Sendable {
             return false
         }
         return try await repairRegistration(
-            startTimeout: startTimeout, settleDelay: settleDelay, isRunning: isRunning)
+            startTimeout: startTimeout, settleDelay: settleDelay, exitTimeout: exitTimeout, daemon: daemon)
     }
 
-    /// Re-registers the service until the daemon comes up, and returns
-    /// whether it did.
+    /// Replaces the registration with a fresh one until a new daemon comes
+    /// up, and returns whether it did.
     ///
+    /// macOS ties a registered launch agent to the exact build of the app
+    /// that registered it. After the app is updated, launchd refuses to spawn
+    /// the new daemon ("spawn failed", exit 78) until it is registered again.
     /// One re-registration is not always enough: right after the app has
     /// been replaced, macOS still rejects the first spawn of the new build
     /// and only accepts a registration made after that.
+    ///
+    /// Anything that can fail up front is checked before the existing
+    /// registration is removed, and a failed registration is retried, so a
+    /// working service is not left unregistered by a transient error.
+    ///
+    /// - Parameters:
+    ///   - exitTimeout: How long the daemon being replaced gets to shut down;
+    ///     the default covers the launch agent's `ExitTimeOut`.
+    ///   - daemon: Identifies the daemon answering on the management socket,
+    ///     or returns `nil` when there is none.
     public func repairRegistration(
         attempts: Int = 3,
         startTimeout: TimeInterval = 6,
         settleDelay: TimeInterval = 1,
-        isRunning: @Sendable () async -> Bool
+        exitTimeout: TimeInterval = 65,
+        daemon: @Sendable () async -> DaemonIdentity?
     ) async throws -> Bool {
+        try requireRegistrableInstallation()
+        try requestStart()
+        let previous = await daemon()?.pid
+        var registrationError: Error?
         for _ in 0..<attempts {
-            try await reregister(settleDelay: settleDelay)
-            if await waitUntilRunning(isRunning, timeout: startTimeout) {
+            // The old registration may already be gone; only the new one matters.
+            try? registration.unregister()
+            // The old daemon withdraws the start request as it shuts down, so
+            // the request made by `register()` must come after its exit.
+            if let previous {
+                _ = await waitForExit(of: previous, timeout: exitTimeout)
+            }
+            try? await Task.sleep(nanoseconds: UInt64(settleDelay * 1_000_000_000))
+            do {
+                try register()
+                registrationError = nil
+            } catch {
+                guard registrationStatus != .requiresApproval else { throw error }
+                registrationError = error
+                continue
+            }
+            if await waitForDaemon(daemon, otherThan: previous, timeout: startTimeout) {
                 return true
             }
+        }
+        if let registrationError {
+            throw registrationError
         }
         return false
     }
 
-    private func waitUntilRunning(_ isRunning: @Sendable () async -> Bool, timeout: TimeInterval) async -> Bool {
+    /// Waits for a daemon to answer that is not the one being replaced: the
+    /// old instance keeps answering while it shuts down.
+    private func waitForDaemon(
+        _ daemon: @Sendable () async -> DaemonIdentity?,
+        otherThan previous: pid_t?,
+        timeout: TimeInterval
+    ) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         repeat {
-            if await isRunning() {
+            if let identity = await daemon(), identity.pid != previous {
                 return true
             }
             try? await Task.sleep(nanoseconds: 200_000_000)
         } while Date() < deadline
         return false
+    }
+
+    private func requireRegistrableInstallation() throws {
+        if installation == .temporaryLocation {
+            throw ServiceError.temporaryLocation
+        }
     }
 
     /// Whether launchd is failing to spawn the registered daemon, as it does

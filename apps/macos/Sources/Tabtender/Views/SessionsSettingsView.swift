@@ -12,7 +12,7 @@ struct SessionsSettingsView: View {
                     snapshot: snapshot,
                     hint: Self.describe(seconds: config.sessions.defaultTTL)
                 ) { label in
-                    TextField(value: $config.sessions.defaultTTL, format: .number.grouping(.never)) { label }
+                    IntegerField(value: $config.sessions.defaultTTL) { label }
                 }
                 SettingRow(
                     title: "Maximum session lifetime",
@@ -20,14 +20,14 @@ struct SessionsSettingsView: View {
                     snapshot: snapshot,
                     hint: Self.describe(seconds: config.sessions.maxTTL)
                 ) { label in
-                    TextField(value: $config.sessions.maxTTL, format: .number.grouping(.never)) { label }
+                    IntegerField(value: $config.sessions.maxTTL) { label }
                 }
             } footer: {
                 SectionFooter("Lifetimes are in seconds. A session is terminated when its lifetime runs out.")
             }
             Section {
                 SettingRow(title: "Maximum concurrent sessions", key: "sessions.maxConcurrent", snapshot: snapshot) { label in
-                    TextField(value: $config.sessions.maxConcurrent, format: .number.grouping(.never)) { label }
+                    IntegerField(value: $config.sessions.maxConcurrent) { label }
                 }
             }
         }

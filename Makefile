@@ -16,7 +16,8 @@ app: ## Build dist/Tabtender.app and a DMG (macOS)
 	packaging/macos/build-app.sh --dmg
 
 lint:
-	gofmt -l . && go vet -tags e2e ./... && golangci-lint run
+	test -z "$$(gofmt -l .)" || { gofmt -l .; exit 1; }
+	go vet -tags e2e ./... && golangci-lint run
 
 clean:
 	rm -rf bin dist apps/macos/.build

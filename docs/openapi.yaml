@@ -10,6 +10,8 @@ info:
 
     Treat a `cdpUrl` as a secret: anyone holding it controls that session's
     browser until the session ends, and proxies or tunnels may log URLs.
+    Controlling a browser includes reading and writing files as the user the
+    service runs as; see the security notes in the README.
 
     The local management API (served on a Unix domain socket) is documented in
     [api.md](api.md).
@@ -151,10 +153,11 @@ paths:
         endpoint. Authorized by either the API key header or the session's
         own token in the `token` query parameter (as in `cdpUrl`). A token
         authorizes only its own session, and stops working when the session
-        ends. Text and binary messages are relayed verbatim in both
-        directions. Disconnecting does not end the session, and clients may
-        reconnect while it is running. When the session ends, clients are
-        closed with status 1001 and reason `session terminated`.
+        ends. Each connection is an independent browser-level CDP
+        connection carrying JSON messages. Disconnecting does not end the
+        session, and clients may reconnect while it is running. When the
+        session ends, clients are closed with status 1001 and reason
+        `session terminated`.
       responses:
         "101":
           description: Switching protocols; the connection is now a CDP WebSocket.
@@ -179,7 +182,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "502":
-          description: The session's browser did not accept the connection (`browser_unreachable`).
+          description: The session's browser did not answer (`browser_unreachable`).
           content:
             application/json:
               schema:

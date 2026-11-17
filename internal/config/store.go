@@ -93,7 +93,10 @@ func (s *Store) resolve(file Config) (Snapshot, error) {
 func (s *Store) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.snapshot
+	snap := s.snapshot
+	// Callers edit what they get; the stored layers must not change with it.
+	snap.File, snap.Effective = snap.File.Clone(), snap.Effective.Clone()
+	return snap
 }
 
 // Save validates file as the new file layer, writes it atomically, and

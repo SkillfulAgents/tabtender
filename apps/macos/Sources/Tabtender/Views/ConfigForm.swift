@@ -5,7 +5,7 @@ import TabtenderKit
 ///
 /// `header` rows are always shown; `content` rows need the daemon and are
 /// replaced by a hint while it is unreachable. The Save bar at the bottom
-/// sends the whole draft to the daemon and shows its validation errors.
+/// sends the draft's edits to the daemon and shows its validation errors.
 struct ConfigForm<Header: View, Content: View>: View {
     @EnvironmentObject private var model: AppModel
     @ViewBuilder var header: Header

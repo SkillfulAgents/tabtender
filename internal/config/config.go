@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
 )
 
@@ -95,6 +96,12 @@ func Default() Config {
 		},
 		App: App{StartOnLogin: true, PreventSleep: true},
 	}
+}
+
+// Clone returns a copy that shares no memory with c.
+func (c Config) Clone() Config {
+	c.Browser.ExtraArgs = slices.Clone(c.Browser.ExtraArgs)
+	return c
 }
 
 // normalize fills values that may be legitimately omitted from a document.

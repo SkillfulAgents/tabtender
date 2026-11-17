@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	gopsnet "github.com/shirou/gopsutil/v4/net"
 	"net"
 	"net/http"
 	"net/url"
@@ -198,6 +199,42 @@ func TestTTLValidation(t *testing.T) {
 }
 
 // A browser that dies on its own is detected and its resources reclaimed.
+// A debugging port would let any local process drive the browser without a
+// credential; browsers are reachable through their debugging pipe only.
+func TestBrowsersOpenNoDebuggingPort(t *testing.T) {
+	d := newSpec(t).start(t)
+	s := d.createSession("")
+	profile := d.ephemeralProfileDir(s.ID)
+	proc := mustBrowserProcess(t, profile)
+
+	// Drive the browser first, so that anything it would open is open.
+	client := d.connect(s)
+	client.call("Browser.getVersion", nil)
+
+	if _, err := os.Stat(filepath.Join(profile, "DevToolsActivePort")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the browser announced a debugging port (stat: %v)", err)
+	}
+	conns, err := gopsnet.ConnectionsPid("tcp", int32(proc.PID))
+	if err != nil {
+		t.Skipf("cannot inspect the browser's sockets: %v", err)
+	}
+	for _, c := range conns {
+		if c.Status == "LISTEN" {
+			t.Fatalf("the browser listens on %s:%d", c.Laddr.IP, c.Laddr.Port)
+		}
+	}
+}
+
+// Browsers are tied to the daemon through their debugging pipe: when the
+// daemon dies without a chance to clean up, they exit by themselves.
+func TestBrowsersDoNotOutliveAKilledDaemon(t *testing.T) {
+	d := newSpec(t).start(t)
+	s := d.createSession("")
+	proc := mustBrowserProcess(t, d.ephemeralProfileDir(s.ID))
+	d.kill()
+	assertGone(t, "the browser of a killed daemon", proc.PID)
+}
+
 func TestBrowserCrashIsDetected(t *testing.T) {
 	spec := newSpec(t)
 	spec.env["TABTENDER_MAX_SESSIONS"] = "1"

@@ -71,8 +71,10 @@ struct TunnelSettingsView: View {
     private func submitToken(_ value: String) {
         isWorking = true
         Task {
-            await model.setTunnelToken(value)
-            token = ""
+            // A rejected token stays in the field to be corrected.
+            if await model.setTunnelToken(value) {
+                token = ""
+            }
             isWorking = false
         }
     }
@@ -99,9 +101,7 @@ struct TunnelSettingsView: View {
             if !status.tunnel.error.isEmpty {
                 Banner.error(status.tunnel.error)
             }
-            if let error = model.actionError {
-                Banner.error(error)
-            }
+            ActionErrorBanner(kind: .tunnel)
             if status.tunnel.state != .disabled {
                 Button("Restart Tunnel") {
                     isWorking = true

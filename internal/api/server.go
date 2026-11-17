@@ -23,7 +23,10 @@ import (
 	"github.com/SkillfulAgents/tabtender/internal/tunnel"
 )
 
-const maxRequestBody = 1 << 20
+const (
+	maxRequestBody  = 1 << 20
+	bodyReadTimeout = 30 * time.Second
+)
 
 // Backend is what the API needs from the daemon beyond its direct
 // dependencies: configuration state and the operations that mutate it.
@@ -33,8 +36,9 @@ type Backend interface {
 	// RunningConfig returns the effective configuration the process booted
 	// with, used to tell which restart-required settings are pending.
 	RunningConfig() config.Config
-	// UpdateConfig validates, persists, and live-applies a new file layer.
-	UpdateConfig(file config.Config) (config.Snapshot, error)
+	// UpdateConfig applies edit to the current file layer, then validates,
+	// persists, and live-applies the result. Updates never interleave.
+	UpdateConfig(edit func(file *config.Config) error) (config.Snapshot, error)
 	// TunnelTokenSource reports where the Cloudflare tunnel token comes
 	// from ("" when none is configured).
 	TunnelTokenSource() string
@@ -120,7 +124,9 @@ const cdpTokenParam = "token"
 
 // cdpSessionID returns the session addressed by a CDP endpoint request.
 func cdpSessionID(r *http.Request) (string, bool) {
-	if r.Method != http.MethodGet {
+	// A path with percent-encoded characters could be read differently
+	// here than by the router; session IDs never need encoding.
+	if r.Method != http.MethodGet || r.URL.RawPath != "" {
 		return "", false
 	}
 	rest, ok := strings.CutPrefix(r.URL.Path, "/v1/sessions/")
@@ -187,8 +193,15 @@ func (s *Server) logRequests(channel string, next http.Handler) http.Handler {
 			level = slog.LevelWarn
 		}
 		s.Logger.Log(r.Context(), level, "request", "channel", channel, "method", r.Method,
-			"path", r.URL.Path, "status", rec.status, "duration", time.Since(start).Round(time.Millisecond).String())
+			"path", loggedPath(r.URL.Path), "status", rec.status, "duration", time.Since(start).Round(time.Millisecond).String())
 	})
+}
+
+// loggedPath drops anything after an encoded "?" that a client put into the
+// path by mistake: what follows would be a query string, credentials included.
+func loggedPath(path string) string {
+	path, _, _ = strings.Cut(path, "?")
+	return path
 }
 
 type errorBody struct {
@@ -246,10 +259,28 @@ func (s *Server) writeSessionError(w http.ResponseWriter, err error) {
 
 // decodeJSON strictly decodes an optional JSON object body into dst.
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	body, err := readBody(w, r)
+	if err != nil {
+		return err
+	}
+	return decodeBody(body, dst)
+}
+
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	// A client that stalls mid-body must not hold the request forever. The
+	// deadline is lifted again so it cannot cut the handler's own work short.
+	rc := http.NewResponseController(w)
+	if rc.SetReadDeadline(time.Now().Add(bodyReadTimeout)) == nil {
+		defer rc.SetReadDeadline(time.Time{}) //nolint:errcheck // set succeeded above
+	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
 	if err != nil {
-		return errors.New("request body is too large or unreadable")
+		return nil, errors.New("request body is too large or unreadable")
 	}
+	return body, nil
+}
+
+func decodeBody(body []byte, dst any) error {
 	if len(strings.TrimSpace(string(body))) == 0 {
 		return nil
 	}
@@ -388,9 +419,13 @@ func (s *Server) browserStatus(includePath bool) browserResponse {
 	resp := browserResponse{Runtime: s.Backend.Config().Effective.Browser.Runtime, Available: true}
 	if resolver, ok := s.Sessions.Runtime().(runtime.ExecutableResolver); ok {
 		path, err := resolver.Executable()
-		if err != nil {
+		switch {
+		case err != nil && includePath:
 			resp.Available, resp.Error = false, err.Error()
-		} else if includePath {
+		case err != nil:
+			// The reason names local paths.
+			resp.Available, resp.Error = false, "the browser executable was not found"
+		case includePath:
 			resp.Executable = path
 		}
 	}

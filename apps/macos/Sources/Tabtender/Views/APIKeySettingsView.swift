@@ -4,6 +4,7 @@ import TabtenderKit
 /// Shows the API key that clients authenticate with and lets it be replaced.
 struct APIKeySettingsView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.controlActiveState) private var controlActiveState
 
     @State private var info: APIKeyInfo?
     @State private var isRevealed = false
@@ -23,7 +24,7 @@ struct APIKeySettingsView: View {
                     }
                     HStack {
                         Button(isRevealed ? "Hide" : "Reveal") { isRevealed.toggle() }
-                        CopyButton(value: info.apiKey, label: "Copy API key")
+                        CopyButton(value: info.apiKey, label: "Copy API key", isSecret: true)
                         Spacer()
                         Button("Regenerate…") { isConfirmingRegeneration = true }
                             .disabled(!info.rotatable)
@@ -51,9 +52,16 @@ struct APIKeySettingsView: View {
         } message: {
             Text("The current key stops working immediately. Every client must be updated with the new key.")
         }
-        .task(id: model.status?.pid) {
+        // The key can be rotated from elsewhere, so it is read again
+        // whenever the window comes back to the front.
+        .task(id: ReloadTrigger(pid: model.status?.pid, isWindowKey: controlActiveState == .key)) {
             await load { try await model.client.apiKey() }
         }
+    }
+
+    private struct ReloadTrigger: Equatable {
+        var pid: Int32?
+        var isWindowKey: Bool
     }
 
     private func load(_ fetch: () async throws -> APIKeyInfo) async {

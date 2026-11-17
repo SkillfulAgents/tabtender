@@ -4,6 +4,7 @@ package platform
 
 import (
 	"errors"
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -32,3 +33,12 @@ func KillTree(pid int) error {
 // ContainDescendants is a no-op on Unix, where orphaned browsers are reclaimed
 // by reconciliation at the next daemon start.
 func ContainDescendants() error { return nil }
+
+// InheritPipe hands the child process the two pipe ends of a browser
+// debugging pipe (commands are read from in, messages written to out) and
+// returns the browser flags that select them. Chrome expects them as file
+// descriptors 3 and 4.
+func InheritPipe(cmd *exec.Cmd, in, out *os.File) ([]string, error) {
+	cmd.ExtraFiles = []*os.File{in, out}
+	return []string{"--remote-debugging-pipe"}, nil
+}

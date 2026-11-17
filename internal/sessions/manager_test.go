@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SkillfulAgents/tabtender/internal/runtime"
 	"github.com/SkillfulAgents/tabtender/internal/runtime/platform"
 	"github.com/SkillfulAgents/tabtender/internal/runtime/runtimetest"
 )
@@ -227,6 +228,8 @@ func TestRequestValidation(t *testing.T) {
 		{"profile traversal", CreateRequest{Profile: "../evil"}, "profile must be"},
 		{"profile separator", CreateRequest{Profile: "a/b"}, "profile must be"},
 		{"profile too long", CreateRequest{Profile: strings.Repeat("a", 65)}, "profile must be"},
+		{"profile named like a Windows device", CreateRequest{Profile: "NUL"}, "profile must be"},
+		{"profile named like a Windows port", CreateRequest{Profile: "com1"}, "profile must be"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -483,8 +486,10 @@ func TestAttachTracksClients(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ := f.Attach(s.ID)
-	if a.Endpoint != f.rt.Instances()[0].CDPEndpoint() {
-		t.Fatalf("endpoint = %q", a.Endpoint)
+	if conn, err := a.Connect(context.Background()); err != nil || f.rt.Instances()[0].Connections() != 1 {
+		t.Fatalf("Connect must reach the session's browser: %v", err)
+	} else {
+		_ = conn.Close()
 	}
 	if got, _ := f.Get(s.ID); got.Clients != 2 {
 		t.Fatalf("clients = %d, want 2", got.Clients)
@@ -510,6 +515,47 @@ func TestAttachTracksClients(t *testing.T) {
 	wantKind(t, err, KindNotFound)
 }
 
+func TestSessionsExpireByTheWallClock(t *testing.T) {
+	f := newFixture(t, nil)
+	s := f.mustCreate(t, CreateRequest{TTLSeconds: ptr(3600)})
+	// A machine that slept: the expiry timer has not fired, yet the
+	// session's time is up.
+	f.mu.Lock()
+	f.active[s.ID].session.ExpiresAt = time.Now().Add(-time.Minute)
+	f.mu.Unlock()
+	eventually(t, "the overdue session to expire", func() bool {
+		got, _ := f.Get(s.ID)
+		return got.Status == StatusTerminated && got.EndReason == ReasonExpired
+	})
+}
+
+// cancelingRuntime launches browsers successfully, but only after the
+// caller's context has been canceled.
+type cancelingRuntime struct {
+	runtime.BrowserRuntime
+	cancel context.CancelFunc
+}
+
+func (r *cancelingRuntime) Launch(_ context.Context, opts runtime.BrowserOptions) (runtime.BrowserInstance, error) {
+	r.cancel()
+	return r.BrowserRuntime.Launch(context.Background(), opts)
+}
+
+func TestSessionOfAClientThatGaveUpIsDiscarded(t *testing.T) {
+	f := newFixture(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	f.SetRuntime(&cancelingRuntime{BrowserRuntime: f.rt, cancel: cancel})
+	if _, err := f.Create(ctx, CreateRequest{Profile: "abandoned"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want canceled", err)
+	}
+	if f.ActiveCount() != 0 || f.rt.Running() != 0 {
+		t.Fatalf("the session lingers: active=%d running=%d", f.ActiveCount(), f.rt.Running())
+	}
+	// Its slot and profile are free again.
+	f.SetRuntime(f.rt)
+	f.mustCreate(t, CreateRequest{Profile: "abandoned"})
+}
+
 func TestShutdownTerminatesEverythingAndRejectsNewSessions(t *testing.T) {
 	f := newFixture(t, nil)
 	a := f.mustCreate(t, CreateRequest{})
@@ -529,8 +575,8 @@ func TestShutdownTerminatesEverythingAndRejectsNewSessions(t *testing.T) {
 		f.Shutdown(context.Background())
 		close(shutdownDone)
 	}()
-	eventually(t, "running sessions to stop", func() bool { return f.rt.Running() == 0 })
-	close(f.rt.Gate)
+	// The launch in flight is abandoned rather than waited for: the gate
+	// never opens.
 	wantKind(t, <-starting, KindShuttingDown)
 	<-shutdownDone
 

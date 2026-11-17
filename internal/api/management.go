@@ -95,12 +95,12 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 // file layer, so clients may send either the full document or only the
 // sections they change.
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
-	file := s.Backend.Config().File
-	if err := decodeJSON(w, r, &file); err != nil {
+	body, err := readBody(w, r)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "validation_error", err.Error())
 		return
 	}
-	snap, err := s.Backend.UpdateConfig(file)
+	snap, err := s.Backend.UpdateConfig(func(file *config.Config) error { return decodeBody(body, file) })
 	switch {
 	case err != nil && snap.Path != "":
 		// The configuration was valid and has been saved, but part of it

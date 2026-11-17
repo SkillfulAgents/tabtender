@@ -144,7 +144,9 @@ jobs:
             $env:GOARCH = $arch
             go build -trimpath -ldflags $ldflags -o "$dir/tabtenderd.exe" ./cmd/tabtenderd
             if ($LASTEXITCODE -ne 0) { throw "build failed for $arch" }
-            Copy-Item packaging/windows/install.ps1, packaging/windows/uninstall.ps1, LICENSE -Destination $dir
+            Copy-Item packaging/windows/install.ps1, packaging/windows/install.cmd, packaging/windows/uninstall.ps1, packaging/windows/uninstall.cmd, LICENSE -Destination $dir
+            bash packaging/third-party-notices.sh "$dir/THIRD_PARTY_NOTICES.txt"
+            if ($LASTEXITCODE -ne 0) { throw "collecting license notices failed" }
             Compress-Archive -Path "$dir/*" -DestinationPath "dist/tabtender-$version-windows-$arch.zip"
           }
       - name: Install client test dependencies
@@ -171,7 +173,15 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum -- * > SHA256SUMS && cat SHA256SUMS
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag
+        # A version with a suffix (v0.1.0-beta.1) is published as a
+        # pre-release, so it never becomes the repository's "latest".
+        run: |
+          flags=(--generate-notes --verify-tag)
+          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" "${flags[@]}"

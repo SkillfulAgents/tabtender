@@ -66,6 +66,9 @@ cp "$SWIFT_BIN/Tabtender" "$APP/Contents/MacOS/Tabtender"
 echo "==> Bundle metadata"
 sed -e "s/__VERSION__/$VERSION/" -e "s/__BUILD__/$BUILD_NUMBER/" "$PKG/Info.plist" >"$APP/Contents/Info.plist"
 cp "$PKG/com.skillfulagents.tabtender.daemon.plist" "$APP/Contents/Library/LaunchAgents/"
+mkdir -p "$APP/Contents/Resources"
+cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE"
+"$ROOT/packaging/third-party-notices.sh" "$APP/Contents/Resources/THIRD_PARTY_NOTICES.txt"
 plutil -lint "$APP/Contents/Info.plist" "$APP/Contents/Library/LaunchAgents/"*.plist >/dev/null
 
 echo "==> Signing ($([ "$IDENTITY" = "-" ] && echo ad-hoc || echo "$IDENTITY"))"

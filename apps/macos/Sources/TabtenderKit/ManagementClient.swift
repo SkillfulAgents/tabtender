@@ -34,6 +34,11 @@ public struct ManagementClient: Sendable {
         try await get("/mgmt/v1/status")
     }
 
+    /// Identifies the running daemon without decoding its full status.
+    public func identity() async throws -> DaemonIdentity {
+        try await get("/mgmt/v1/status")
+    }
+
     public func health() async throws -> HealthStatus {
         try await get("/v1/health")
     }
@@ -66,6 +71,14 @@ public struct ManagementClient: Sendable {
     /// document and rejects it with a `validation_error` when it is invalid.
     public func updateConfig(_ file: Configuration) async throws -> ConfigSnapshot {
         try await send("PUT", "/mgmt/v1/config", body: file)
+    }
+
+    /// Persists the settings in `file` that differ from `base`, the document
+    /// the edits were made to, leaving every other stored setting as it is.
+    public func updateConfig(_ file: Configuration, changedFrom base: Configuration) async throws -> ConfigSnapshot {
+        let changes = try file.changes(from: base)
+        return try await perform(
+            HTTPRequest(method: "PUT", path: "/mgmt/v1/config", body: changes), timeout: mutationTimeout)
     }
 
     // MARK: Secrets

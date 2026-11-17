@@ -97,6 +97,21 @@ final class ManagementClientTests: XCTestCase {
         XCTAssertEqual(requests[1].timeout, 42)
     }
 
+    func testIdentityToleratesAStatusItCannotFullyDecode() async throws {
+        let json = #"{"version":"9.0.0","pid":4242,"sessions":"renamed in a later release"}"#
+        let client = ManagementClient(transport: StubTransport(status: "200 OK", json: json))
+        let identity = try await client.identity()
+        XCTAssertEqual(identity, DaemonIdentity(version: "9.0.0", pid: 4242))
+        do {
+            _ = try await client.status()
+            XCTFail("expected a decoding failure")
+        } catch {
+            guard case ManagementError.invalidResponse = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+        }
+    }
+
     func testSessionIdentifiersAreEscapedInPaths() async {
         let transport = StubTransport(status: "404 Not Found", json: #"{"error":{"code":"not_found","message":"gone"}}"#)
         let client = ManagementClient(transport: transport)

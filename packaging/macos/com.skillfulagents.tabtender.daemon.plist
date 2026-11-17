@@ -35,6 +35,11 @@
 	<string>Aqua</string>
 	<key>ProcessType</key>
 	<string>Interactive</string>
+	<!-- No StandardErrorPath: launchd takes the path literally (no ~ or
+	     $HOME), and this plist is shared by every user of the Mac. A fixed
+	     path would be writable by only one of them, and launchd can fail to
+	     spawn a job whose output file it cannot open. tabtenderd logs to
+	     ~/Library/Application Support/Tabtender/logs itself. -->
 	<!-- Give sessions time to shut their browsers down cleanly. -->
 	<key>ExitTimeOut</key>
 	<integer>60</integer>

@@ -37,7 +37,7 @@ private struct MenuBarIcon: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        Image(systemName: model.status == nil ? "rectangle.stack" : "rectangle.stack.fill")
+        Image(systemName: model.reachability == .running ? "rectangle.stack.fill" : "rectangle.stack")
             .accessibilityLabel("Tabtender")
     }
 }

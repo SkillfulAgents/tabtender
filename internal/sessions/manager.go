@@ -31,6 +31,14 @@ const (
 
 var profileNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 
+// reservedProfileNames are device names that Windows refuses as directory
+// names. They are rejected everywhere so profiles stay portable.
+var reservedProfileNames = regexp.MustCompile(`(?i)^(con|prn|aux|nul|com[0-9]|lpt[0-9])$`)
+
+func validProfileName(name string) bool {
+	return profileNamePattern.MatchString(name) && !reservedProfileNames.MatchString(name)
+}
+
 // Options configures a Manager.
 type Options struct {
 	// ProfilesDir is the private root for all browser profile directories.
@@ -65,6 +73,14 @@ type Manager struct {
 	profiles   map[string]string // lowercased profile name -> session ID
 	tombstones map[string]Session
 	closed     bool
+
+	// lifetime ends when the manager shuts down; browser launches in
+	// flight are abandoned with it.
+	lifetime    context.Context
+	endLifetime context.CancelFunc
+	// notifyMu orders OnActiveChange calls, so the last one delivered
+	// always carries the current count.
+	notifyMu sync.Mutex
 
 	stopMonitor chan struct{}
 	monitorDone chan struct{}
@@ -110,6 +126,7 @@ func NewManager(opts Options) *Manager {
 		stopMonitor: make(chan struct{}),
 		monitorDone: make(chan struct{}),
 	}
+	m.lifetime, m.endLifetime = context.WithCancel(context.Background())
 	go m.monitor(opts.MonitorInterval)
 	return m
 }
@@ -210,7 +227,7 @@ func (l Limits) resolve(req CreateRequest) (ttl time.Duration, headless bool, er
 		}
 		headless = *req.Headless
 	}
-	if req.Profile != "" && !profileNamePattern.MatchString(req.Profile) {
+	if req.Profile != "" && !validProfileName(req.Profile) {
 		return 0, false, newError(KindValidation,
 			"profile must be 1-64 characters of letters, digits, '-' or '_' and start with a letter or digit")
 	}
@@ -276,10 +293,17 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (Session, error
 	m.mu.Unlock()
 	m.notifyActive()
 
-	instance, launchErr := e.rt.Launch(ctx, runtime.BrowserOptions{Headless: headless, ProfileDir: e.profileDir})
+	launchCtx, cancelLaunch := context.WithCancel(ctx)
+	stopWatching := context.AfterFunc(m.lifetime, cancelLaunch)
+	instance, launchErr := e.rt.Launch(launchCtx, runtime.BrowserOptions{Headless: headless, ProfileDir: e.profileDir})
+	stopWatching()
+	cancelLaunch()
 
 	m.mu.Lock()
-	if launchErr == nil && e.abort == "" {
+	// A caller that gave up while the browser was starting will never learn
+	// the session's ID; keeping the session would only hold a slot.
+	abandoned := launchErr == nil && e.abort == "" && ctx.Err() != nil
+	if launchErr == nil && e.abort == "" && !abandoned {
 		e.instance = instance
 		e.session.PID = instance.PID()
 		e.session.Status = StatusRunning
@@ -303,8 +327,14 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (Session, error
 		}
 		cancel()
 	}
-	m.finish(e, reason, launchErr == nil)
-	if launchErr != nil {
+	m.finish(e, reason, launchErr == nil && !abandoned)
+	switch {
+	case abandoned:
+		m.logger.Info("session discarded: the client gave up while it was starting", "session", id)
+		return Session{}, ctx.Err()
+	case launchErr != nil && m.lifetime.Err() != nil:
+		return Session{}, newError(KindShuttingDown, "the service is shutting down")
+	case launchErr != nil:
 		m.logger.Error("browser launch failed", "session", id, "error", launchErr)
 		return Session{}, &Error{Kind: KindLaunchFailed, Message: "failed to launch browser: " + launchErr.Error(), Err: launchErr}
 	}
@@ -383,6 +413,8 @@ func (m *Manager) notifyActive() {
 	if m.onActive == nil {
 		return
 	}
+	m.notifyMu.Lock()
+	defer m.notifyMu.Unlock()
 	m.mu.Lock()
 	n := len(m.active)
 	m.mu.Unlock()
@@ -485,9 +517,8 @@ func (m *Manager) ActiveCount() int {
 
 // Attachment is a client's hold on a session's CDP endpoint.
 type Attachment struct {
-	// Endpoint is the browser's loopback CDP WebSocket URL. It must never
-	// be handed to remote clients.
-	Endpoint string
+	// Connect opens a CDP connection to the session's browser.
+	Connect func(ctx context.Context) (runtime.CDPConn, error)
 	// Done is closed when the session has ended.
 	Done    <-chan struct{}
 	release func()
@@ -513,8 +544,8 @@ func (m *Manager) Attach(id string) (*Attachment, error) {
 	e.session.Clients++
 	var once sync.Once
 	return &Attachment{
-		Endpoint: e.instance.CDPEndpoint(),
-		Done:     e.done,
+		Connect: e.instance.Connect,
+		Done:    e.done,
 		release: func() {
 			once.Do(func() {
 				m.mu.Lock()
@@ -538,17 +569,30 @@ func (m *Manager) monitor(interval time.Duration) {
 			return
 		case <-ticker.C:
 		}
+		// Expiry timers run on the monotonic clock, which stands still
+		// while the machine sleeps; the wall clock catches sessions that
+		// outlived their TTL that way.
+		now := time.Now()
 		m.mu.Lock()
-		var crashed []string
+		var crashed, overdue []string
 		for id, e := range m.active {
-			if e.session.Status == StatusRunning && !e.instance.IsRunning() {
+			if e.session.Status != StatusRunning {
+				continue
+			}
+			switch {
+			case !e.instance.IsRunning():
 				crashed = append(crashed, id)
+			case now.After(e.session.ExpiresAt):
+				overdue = append(overdue, id)
 			}
 		}
 		m.mu.Unlock()
 		for _, id := range crashed {
 			m.logger.Warn("browser exited unexpectedly", "session", id)
 			go func() { _ = m.terminate(context.Background(), id, ReasonCrashed) }()
+		}
+		for _, id := range overdue {
+			go m.expire(id)
 		}
 	}
 }
@@ -562,6 +606,7 @@ func (m *Manager) Shutdown(ctx context.Context) {
 		return
 	}
 	m.closed = true
+	m.endLifetime()
 	ids := make([]string, 0, len(m.active))
 	for id := range m.active {
 		ids = append(ids, id)
@@ -608,7 +653,7 @@ func (m *Manager) Profiles() ([]ProfileInfo, error) {
 
 // DeleteProfile removes a named profile that is not in use.
 func (m *Manager) DeleteProfile(name string) error {
-	if !profileNamePattern.MatchString(name) {
+	if !validProfileName(name) {
 		return newError(KindValidation, "invalid profile name")
 	}
 	m.mu.Lock()

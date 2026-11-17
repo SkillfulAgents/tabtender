@@ -15,15 +15,13 @@ struct MenuBarView: View {
                     systemImage: "arrow.triangle.2.circlepath",
                     tint: .orange
                 ) {
-                    Button("Restart") { Task { await model.restartService() } }
-                        .disabled(model.isChangingService)
+                    RestartServiceButton()
                 }
             }
-            if let error = model.actionError {
-                Banner.error(error)
-            }
-            if model.serviceState == .requiresApproval {
-                Text("Allow Tabtender in System Settings > General > Login Items to run the service.")
+            ActionErrorBanner(kind: .service)
+            ActionErrorBanner(kind: .session)
+            if let explanation = model.serviceState.explanation {
+                Text(explanation)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

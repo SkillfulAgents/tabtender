@@ -5,27 +5,27 @@ import TabtenderKit
 /// polling, plus the configuration draft being edited in Settings.
 @MainActor
 final class AppModel: ObservableObject {
-    /// What the user needs to know about the background service.
-    enum ServiceState {
-        case running
-        case stopped
-        case notRegistered
-        case requiresApproval
-        /// The launch agent is missing, e.g. when running outside the app bundle.
-        case unavailable
+    /// The kinds of action whose failures are reported separately, each next
+    /// to the controls that caused it.
+    enum ActionKind {
+        case service
+        case session
+        case tunnel
     }
 
     // MARK: Daemon state
 
     @Published private(set) var registration: ServiceRegistrationStatus
-    /// `nil` while the daemon is not answering.
+    @Published private(set) var reachability = DaemonReachability.notRunning
+    /// `nil` unless the daemon is running and answering.
     @Published private(set) var status: DaemonStatus?
     @Published private(set) var health: HealthStatus?
     /// Sessions whose browser is still alive.
     @Published private(set) var sessions: [Session] = []
     @Published private(set) var isChangingService = false
-    /// The most recent failed action, shown until the next one succeeds.
-    @Published private(set) var actionError: String?
+    /// The most recent failure of each kind of action, shown until the next
+    /// action of that kind or until dismissed.
+    @Published private(set) var actionErrors: [ActionKind: String] = [:]
 
     // MARK: Configuration editing
 
@@ -39,6 +39,9 @@ final class AppModel: ObservableObject {
     private let service: ServiceController
     private let defaults: UserDefaults
     private var pollTask: Task<Void, Never>?
+    /// Known even when the rest of the daemon's status cannot be decoded.
+    private var identity: DaemonIdentity?
+    private var refreshGeneration = 0
 
     private static let pollInterval: UInt64 = 2_000_000_000
     private static let firstLaunchKey = "didCompleteFirstLaunch"
@@ -57,15 +60,7 @@ final class AppModel: ObservableObject {
     }
 
     var serviceState: ServiceState {
-        if status != nil {
-            return .running
-        }
-        switch registration {
-        case .enabled: return .stopped
-        case .notRegistered: return .notRegistered
-        case .requiresApproval: return .requiresApproval
-        case .notFound: return .unavailable
-        }
+        ServiceState(daemon: reachability, registration: registration, installation: service.installation)
     }
 
     var hasUnsavedChanges: Bool {
@@ -74,8 +69,8 @@ final class AppModel: ObservableObject {
 
     // MARK: Lifecycle
 
-    /// Connects to the daemon and starts polling. On the very first launch
-    /// the service is registered, which also starts it; later launches only
+    /// Connects to the daemon and starts polling. On the first launch the
+    /// service is registered, which also starts it; later launches only
     /// reconnect and never restart a running daemon.
     func activate() {
         guard pollTask == nil else { return }
@@ -90,11 +85,21 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// The first launch counts as done only once the service is registered,
+    /// so a launch from where that is impossible (a disk image, say) leaves
+    /// it for the next one.
     private func registerOnFirstLaunch() async {
         guard !defaults.bool(forKey: Self.firstLaunchKey) else { return }
-        defaults.set(true, forKey: Self.firstLaunchKey)
-        if serviceState == .notRegistered {
+        switch serviceState.firstLaunchStep {
+        case .register:
             await registerService()
+            if registration == .enabled || registration == .requiresApproval {
+                defaults.set(true, forKey: Self.firstLaunchKey)
+            }
+        case .finish:
+            defaults.set(true, forKey: Self.firstLaunchKey)
+        case .postpone:
+            break
         }
     }
 
@@ -103,15 +108,16 @@ final class AppModel: ObservableObject {
     /// registered with, and a daemon that kept running across an update is
     /// still the old one.
     private func repairStaleRegistration() async {
-        guard registration == .enabled else { return }
+        guard registration == .enabled, service.installation == .registrable else { return }
         let service = self.service
-        let runningVersion = status?.version
+        let runningVersion = identity?.version
+        let isStopped = reachability == .notRunning
         let isStale = await Task.detached {
             if let runningVersion {
                 guard let bundled = service.bundledDaemonVersion else { return false }
                 return bundled != runningVersion
             }
-            return service.isSpawnFailing
+            return isStopped && service.isSpawnFailing
         }.value
         if isStale {
             await reregisterService()
@@ -120,22 +126,39 @@ final class AppModel: ObservableObject {
 
     /// Re-reads everything the popover shows.
     func refresh() async {
-        registration = service.registrationStatus
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        let service = self.service
+        let registration = await Task.detached { service.registrationStatus }.value
+
+        var reachability = DaemonReachability.running
+        var identity: DaemonIdentity?
+        var details: (status: DaemonStatus, health: HealthStatus, sessions: [Session])?
         do {
+            identity = try await client.identity()
             async let status = client.status()
             async let health = client.health()
             async let sessions = client.sessions()
-            let wasRunning = self.status != nil
-            self.status = try await status
-            self.health = try await health
-            self.sessions = try await sessions.filter(\.isActive)
-            if !wasRunning || config == nil {
-                await reloadConfig()
-            }
+            details = try await (status, health, sessions)
         } catch {
-            status = nil
-            health = nil
-            sessions = []
+            reachability = DaemonReachability(failure: error)
+            if reachability == .notRunning {
+                identity = nil
+            }
+        }
+
+        // A refresh that started later has seen newer state; letting this
+        // one finish would flip the UI back for a poll cycle.
+        guard generation == refreshGeneration else { return }
+        let wasRunning = self.reachability == .running
+        self.registration = registration
+        self.reachability = reachability
+        self.identity = identity
+        status = details?.status
+        health = details?.health
+        sessions = details?.sessions.filter(\.isActive) ?? []
+        if details != nil, !wasRunning || config == nil {
+            await reloadConfig()
         }
     }
 
@@ -144,7 +167,7 @@ final class AppModel: ObservableObject {
     func registerService() async {
         let client = self.client
         await changeService(expectRunning: true) { service in
-            _ = try await service.registerVerified { (try? await client.status()) != nil }
+            _ = try await service.registerVerified { try? await client.identity() }
         }
     }
 
@@ -152,7 +175,7 @@ final class AppModel: ObservableObject {
     func reregisterService() async {
         let client = self.client
         await changeService(expectRunning: true) { service in
-            _ = try await service.repairRegistration { (try? await client.status()) != nil }
+            _ = try await service.repairRegistration { try? await client.identity() }
         }
     }
 
@@ -165,10 +188,13 @@ final class AppModel: ObservableObject {
     /// a failure after that is reported instead of leaving the user guessing.
     func startService() async {
         await changeService(expectRunning: true) { try $0.start() }
-        guard status == nil, actionError == nil, registration == .enabled else { return }
+        // Replacing the registration kills whatever daemon it runs, so it is
+        // reserved for a daemon that is really gone, not one that is merely
+        // slow to answer.
+        guard reachability == .notRunning, actionErrors[.service] == nil, registration == .enabled else { return }
         await reregisterService()
-        if status == nil, actionError == nil {
-            actionError = Self.startFailureMessage
+        if reachability == .notRunning, actionErrors[.service] == nil {
+            actionErrors[.service] = Self.startFailureMessage
         }
     }
 
@@ -179,7 +205,7 @@ final class AppModel: ObservableObject {
     /// Stops the daemon, waits for it to exit, and starts it again so that
     /// restart-required settings take effect.
     func restartService() async {
-        let pid = status?.pid
+        let pid = identity?.pid
         await changeService(expectRunning: true) { service in
             try service.stop()
             if let pid, await !service.waitForExit(of: pid) {
@@ -197,20 +223,23 @@ final class AppModel: ObservableObject {
     ) async {
         isChangingService = true
         defer { isChangingService = false }
+        actionErrors[.service] = nil
         let service = self.service
         do {
             try await Task.detached { try await operation(service) }.value
-            actionError = nil
         } catch {
+            await refresh()
             // Registering a service that needs approval fails, but the state
             // shown to the user already explains what to do.
-            actionError = service.registrationStatus == .requiresApproval ? nil : error.localizedDescription
-            await refresh()
+            if registration != .requiresApproval {
+                actionErrors[.service] = error.localizedDescription
+            }
             return
         }
+        let settled = expectRunning ? DaemonReachability.running : .notRunning
         for _ in 0..<25 {
             await refresh()
-            if (status != nil) == expectRunning {
+            if reachability == settled {
                 return
             }
             try? await Task.sleep(nanoseconds: 200_000_000)
@@ -220,7 +249,7 @@ final class AppModel: ObservableObject {
     // MARK: Sessions
 
     func terminate(_ session: Session) async {
-        await perform {
+        await perform(.session) {
             try await self.client.terminateSession(id: session.id)
         }
     }
@@ -228,26 +257,35 @@ final class AppModel: ObservableObject {
     // MARK: Tunnel
 
     func restartTunnel() async {
-        await perform {
+        await perform(.tunnel) {
             try await self.client.restartTunnel()
         }
     }
 
     /// Stores the Cloudflare tunnel token; an empty token removes it.
-    func setTunnelToken(_ token: String) async {
-        await perform {
+    /// Returns whether the daemon accepted it.
+    func setTunnelToken(_ token: String) async -> Bool {
+        await perform(.tunnel) {
             try await self.client.setTunnelToken(token)
         }
     }
 
-    private func perform(_ action: () async throws -> Void) async {
+    func dismissError(_ kind: ActionKind) {
+        actionErrors[kind] = nil
+    }
+
+    @discardableResult
+    private func perform(_ kind: ActionKind, _ action: () async throws -> Void) async -> Bool {
+        actionErrors[kind] = nil
+        var succeeded = true
         do {
             try await action()
-            actionError = nil
         } catch {
-            actionError = error.localizedDescription
+            actionErrors[kind] = error.localizedDescription
+            succeeded = false
         }
         await refresh()
+        return succeeded
     }
 
     // MARK: Configuration
@@ -258,14 +296,16 @@ final class AppModel: ObservableObject {
         apply(snapshot)
     }
 
-    /// Persists the draft. Validation errors reported by the daemon are kept
-    /// in `saveError` and the draft is left as edited.
+    /// Persists the draft's edits. Only the settings the user changed are
+    /// sent, so changes made elsewhere since the draft was loaded survive.
+    /// Validation errors reported by the daemon are kept in `saveError` and
+    /// the draft is left as edited.
     func saveConfig() async {
-        guard let draft else { return }
+        guard let draft, let base = config?.file else { return }
         isSaving = true
         defer { isSaving = false }
         do {
-            let snapshot = try await client.updateConfig(draft)
+            let snapshot = try await client.updateConfig(draft, changedFrom: base)
             config = snapshot
             self.draft = snapshot.file
             saveError = nil
@@ -283,7 +323,11 @@ final class AppModel: ObservableObject {
     }
 
     private func apply(_ snapshot: ConfigSnapshot) {
-        if !hasUnsavedChanges {
+        if let draft, let base = config?.file, draft != base {
+            // Carry the unsaved edits over to the new document, so that
+            // saving them does not undo what changed underneath.
+            self.draft = (try? draft.rebased(from: base, onto: snapshot.file)) ?? draft
+        } else {
             draft = snapshot.file
         }
         config = snapshot

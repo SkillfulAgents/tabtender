@@ -89,6 +89,13 @@ unauthenticated caller cannot tell which endpoints or sessions exist.
 > headers: reverse proxies, tunnels, and client libraries may write them to
 > logs. Tabtender itself never logs query strings. To revoke a URL, delete
 > the session.
+>
+> **Controlling a browser is more than browsing.** The token limits its
+> holder to one session at the API. It does not confine the browser: through
+> CDP the holder can read local files the service's user can read (`file://`
+> URLs) and write files (downloads). Give a `cdpUrl` only to code you would
+> trust with that user account, or run Tabtender under a dedicated account or
+> on a dedicated machine. See [Security](../README.md#security).
 
 ### The session object
 
@@ -127,8 +134,7 @@ unauthenticated caller cannot tell which endpoints or sessions exist.
 4. Otherwise you get a URL on the `Host` you used — `wss://` if the request
    arrived over TLS or with `X-Forwarded-Proto: https`, else `ws://`.
 
-The session's token is then appended as the `token` query parameter. The
-browser's own CDP port is bound to loopback and never appears in any response.
+The session's token is then appended as the `token` query parameter.
 
 ### `POST /v1/sessions` — create a session
 
@@ -191,23 +197,28 @@ Responses: `200` with the terminated session object; `404 session_not_found`
 
 ### `GET /v1/sessions/{id}/cdp` — CDP WebSocket
 
-Upgrades to a WebSocket connected to the session's browser-level CDP endpoint
-(the equivalent of Chrome's `/devtools/browser/<id>`).
+Upgrades to a WebSocket that speaks browser-level CDP with the session's
+browser (the equivalent of Chrome's `/devtools/browser/<id>`).
 
 Authorized by **either** the session's token in the query string — which is
 what `cdpUrl` already contains — **or** the API key in an `Authorization`
 header (then the token may be omitted).
 
-- Text and binary messages are relayed verbatim in both directions and never
-  inspected. There is no message size limit.
-- Any number of clients may connect to one session.
+- Every connection is an independent CDP connection: clients may use the same
+  command IDs, and what one client attaches to or enables is its own. There
+  is no message size limit.
+- Messages are JSON, as CDP defines them. Messages from the browser arrive as
+  text frames; from the client, text and binary frames are both accepted. A
+  frame that is not a JSON object closes the connection with status `1007`.
+- Any number of clients may connect to one session. A client that stops
+  reading while the browser keeps producing output for it is disconnected
+  once 256 MiB are waiting.
 - Disconnecting does not end the session; reconnect to the same URL at any
   time while it is running.
 - The server sends WebSocket pings every 30 seconds, so idle connections stay
   open through proxies and tunnels.
 - When the session ends, clients are closed with status `1001` (going away)
-  and reason `session terminated`. A close initiated by the browser is passed
-  through with its original status code and reason.
+  and reason `session terminated`.
 
 ```js
 // With the URL alone:
@@ -227,7 +238,7 @@ Handshake errors are ordinary HTTP responses:
 | `404 session_not_found` | Valid API key, unknown session |
 | `409 session_not_running` | The session has ended (or is still starting). Returned to the API key, and to the session's own former token for ten minutes after it ended, so the holder of a URL can tell "over" from "wrong" |
 | `426 upgrade_required` | Not a WebSocket upgrade |
-| `502 browser_unreachable` | The browser did not accept the connection |
+| `502 browser_unreachable` | The browser did not answer |
 
 ### `GET /v1/health` — health and capacity
 

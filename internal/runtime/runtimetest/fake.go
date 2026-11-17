@@ -1,20 +1,17 @@
 // Package runtimetest provides a fake BrowserRuntime for tests. Its
-// "browsers" are in-process WebSocket echo servers, which makes it possible
+// "browsers" echo every CDP message back, which makes it possible
 // to exercise the session manager and the CDP proxy without a real browser —
 // and demonstrates that the core depends only on the runtime interfaces.
 package runtimetest
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
+	"io"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
-
-	"github.com/coder/websocket"
 
 	"github.com/SkillfulAgents/tabtender/internal/runtime"
 )
@@ -85,7 +82,6 @@ func (r *Runtime) Launch(ctx context.Context, opts runtime.BrowserOptions) (runt
 	}
 	inst := &Instance{Options: opts}
 	inst.running.Store(true)
-	inst.server = httptest.NewServer(http.HandlerFunc(inst.serveCDP))
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -113,19 +109,29 @@ type Instance struct {
 	Options runtime.BrowserOptions
 
 	pid     int
-	server  *httptest.Server
 	running atomic.Bool
 	stop    sync.Once
 
-	mu    sync.Mutex
-	conns []*websocket.Conn
-	// Handshakes records the headers of each CDP handshake the browser saw.
-	handshakes []http.Header
+	mu          sync.Mutex
+	conns       []*conn
+	connections int
+	connectErr  error
 }
 
-// CDPEndpoint implements runtime.BrowserInstance.
-func (i *Instance) CDPEndpoint() string {
-	return "ws" + strings.TrimPrefix(i.server.URL, "http") + "/devtools/browser/fake"
+// Connect implements runtime.BrowserInstance.
+func (i *Instance) Connect(context.Context) (runtime.CDPConn, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.connectErr != nil {
+		return nil, i.connectErr
+	}
+	if !i.running.Load() {
+		return nil, errors.New("runtimetest: browser is not running")
+	}
+	c := &conn{messages: make(chan []byte, 64), closed: make(chan struct{})}
+	i.conns = append(i.conns, c)
+	i.connections++
+	return c, nil
 }
 
 // PID implements runtime.BrowserInstance.
@@ -138,63 +144,69 @@ func (i *Instance) IsRunning() bool { return i.running.Load() }
 func (i *Instance) Crash() {
 	i.stop.Do(func() {
 		i.running.Store(false)
-		i.mu.Lock()
-		conns := i.conns
-		i.conns = nil
-		i.mu.Unlock()
-		for _, c := range conns {
-			_ = c.CloseNow()
-		}
-		i.server.CloseClientConnections()
-		i.server.Close()
+		i.DropClients()
 	})
 }
 
-// Handshakes returns the headers of every CDP handshake received.
-func (i *Instance) Handshakes() []http.Header {
+// FailConnect makes every later Connect fail with err.
+func (i *Instance) FailConnect(err error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	return append([]http.Header(nil), i.handshakes...)
+	i.connectErr = err
 }
 
-// CloseClients closes every CDP connection with the given status, as a
-// browser does when it shuts a debugging session.
-func (i *Instance) CloseClients(code websocket.StatusCode, reason string) {
+// Connections returns how many CDP connections were ever opened.
+func (i *Instance) Connections() int {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.connections
+}
+
+// DropClients ends every CDP connection from the browser's side.
+func (i *Instance) DropClients() {
 	i.mu.Lock()
 	conns := i.conns
 	i.conns = nil
 	i.mu.Unlock()
 	for _, c := range conns {
-		_ = c.Close(code, reason)
+		_ = c.Close()
 	}
 }
 
-// serveCDP echoes every message back with its original type.
-func (i *Instance) serveCDP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/devtools/browser/fake" {
-		http.NotFound(w, r)
-		return
+// conn echoes every message back.
+type conn struct {
+	messages chan []byte
+	closed   chan struct{}
+	once     sync.Once
+}
+
+func (c *conn) Read(ctx context.Context) ([]byte, error) {
+	select {
+	case msg := <-c.messages:
+		return msg, nil
+	case <-c.closed:
+		return nil, io.EOF
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	i.mu.Lock()
-	i.handshakes = append(i.handshakes, r.Header.Clone())
-	i.mu.Unlock()
-	conn, err := websocket.Accept(w, r, nil)
-	if err != nil {
-		return
+}
+
+func (c *conn) Write(ctx context.Context, msg []byte) error {
+	// Like a real debugging pipe, which frames messages with NUL.
+	if bytes.IndexByte(msg, 0) >= 0 {
+		return runtime.ErrInvalidMessage
 	}
-	conn.SetReadLimit(-1)
-	i.mu.Lock()
-	i.conns = append(i.conns, conn)
-	i.mu.Unlock()
-	defer conn.CloseNow() //nolint:errcheck // test helper
-	ctx := context.Background()
-	for {
-		typ, data, err := conn.Read(ctx)
-		if err != nil {
-			return
-		}
-		if err := conn.Write(ctx, typ, data); err != nil {
-			return
-		}
+	select {
+	case c.messages <- append([]byte(nil), msg...):
+		return nil
+	case <-c.closed:
+		return io.ErrClosedPipe
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+}
+
+func (c *conn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
 }

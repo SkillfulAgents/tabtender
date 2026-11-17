@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/SkillfulAgents/tabtender/internal/config"
 	"github.com/SkillfulAgents/tabtender/internal/daemon"
@@ -63,6 +64,17 @@ func runCommand(args []string) error {
 	var stderr io.Writer = os.Stderr
 	if service.IsWindowsService() {
 		stderr = nil
+	}
+	if *launchd {
+		// launchd discards standard error. Keep what the runtime prints
+		// when the daemon dies (the log file has everything else).
+		stderr = nil
+		if paths, err := config.ResolvePaths(nil); err == nil {
+			logDir := filepath.Dir(paths.LogFile())
+			if os.MkdirAll(logDir, 0o700) == nil {
+				_ = platform.RedirectStderr(filepath.Join(logDir, "tabtenderd.crash.log"))
+			}
+		}
 	}
 	return service.Run(func(ctx context.Context) error {
 		return daemon.Run(ctx, daemon.Options{Launchd: *launchd, Stderr: stderr})

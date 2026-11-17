@@ -25,7 +25,11 @@ func takeBlob(b *windows.DataBlob) []byte {
 }
 
 // dpapiProtect encrypts data so that only the current account (the service
-// account when running as a Windows Service) can decrypt it.
+// account when running as a Windows Service) can decrypt it. The DPAPI keys
+// live in that account's profile, which the Service Control Manager loads for
+// every service account, including virtual accounts such as
+// NT SERVICE\tabtenderd. The secret is therefore tied to the account: it
+// cannot be read after the service is switched to another one.
 func dpapiProtect(plain []byte) ([]byte, error) {
 	var out windows.DataBlob
 	if err := windows.CryptProtectData(blob(plain), nil, nil, 0, nil, windows.CRYPTPROTECT_UI_FORBIDDEN, &out); err != nil {

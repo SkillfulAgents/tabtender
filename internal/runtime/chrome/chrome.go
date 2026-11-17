@@ -9,16 +9,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/coder/websocket"
 
 	"github.com/SkillfulAgents/tabtender/internal/config"
 	"github.com/SkillfulAgents/tabtender/internal/runtime"
@@ -29,20 +25,18 @@ import (
 const Kind = "chrome"
 
 const (
-	// activePortFile is written by Chrome into the profile directory once
-	// the DevTools server is listening: line 1 is the port, line 2 the
-	// browser WebSocket path.
-	activePortFile = "DevToolsActivePort"
-
 	startupTimeout = 45 * time.Second
 	// gracePeriod is how long a browser gets to exit by itself after being
 	// asked to, before its process tree is killed.
 	gracePeriod         = 10 * time.Second
 	closeRequestTimeout = 3 * time.Second
 	killTimeout         = 10 * time.Second
-	pollInterval        = 25 * time.Millisecond
+	stderrDrainTimeout  = time.Second
 	stderrTailSize      = 4 << 10
 )
+
+// staleLockFiles are Chrome's single-instance markers in a profile directory.
+var staleLockFiles = []string{"SingletonLock", "SingletonCookie", "SingletonSocket"}
 
 // Runtime launches Chrome processes.
 type Runtime struct {
@@ -80,13 +74,12 @@ func (r *Runtime) Executable() (string, error) {
 	return "", errors.New("no Chrome installation found; install Google Chrome or set browser.executablePath")
 }
 
-func launchArgs(opts runtime.BrowserOptions, extra []string) []string {
-	args := []string{
-		// Port 0 makes Chrome pick a free loopback port, which it reports
-		// through the DevToolsActivePort file. Chrome only ever binds the
-		// DevTools server to loopback.
-		"--remote-debugging-port=0",
-		"--user-data-dir=" + opts.ProfileDir,
+// launchArgs builds the browser command line. transport holds the flags that
+// select the debugging pipe.
+func launchArgs(opts runtime.BrowserOptions, transport, extra []string) []string {
+	args := append([]string{}, transport...)
+	args = append(args,
+		"--user-data-dir="+opts.ProfileDir,
 		"--no-first-run",
 		"--no-default-browser-check",
 		"--disable-search-engine-choice-screen",
@@ -95,7 +88,7 @@ func launchArgs(opts runtime.BrowserOptions, extra []string) []string {
 		// the OS keychain on every fresh profile.
 		"--password-store=basic",
 		"--use-mock-keychain",
-	}
+	)
 	if opts.Headless {
 		args = append(args, "--headless=new")
 	}
@@ -103,11 +96,26 @@ func launchArgs(opts runtime.BrowserOptions, extra []string) []string {
 	return append(args, "about:blank")
 }
 
-// Launch starts a browser with its own profile directory and waits until its
-// CDP endpoint is ready.
+// checkExtraArgs rejects flags that would open a debugging endpoint next to
+// the pipe: a debugging port is reachable by every local process, without
+// any credential.
+func checkExtraArgs(extra []string) error {
+	for _, arg := range extra {
+		if strings.HasPrefix(arg, "--remote-debugging-") || strings.HasPrefix(arg, "--remote-allow-origins") {
+			return fmt.Errorf("browser.extraArgs must not configure remote debugging (%s)", arg)
+		}
+	}
+	return nil
+}
+
+// Launch starts a browser with its own profile directory and waits until it
+// answers on its debugging pipe.
 func (r *Runtime) Launch(ctx context.Context, opts runtime.BrowserOptions) (runtime.BrowserInstance, error) {
 	if opts.ProfileDir == "" {
 		return nil, errors.New("chrome: profile directory is required")
+	}
+	if err := checkExtraArgs(r.cfg.ExtraArgs); err != nil {
+		return nil, err
 	}
 	executable, err := r.Executable()
 	if err != nil {
@@ -116,78 +124,109 @@ func (r *Runtime) Launch(ctx context.Context, opts runtime.BrowserOptions) (runt
 	if err := os.MkdirAll(opts.ProfileDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create profile directory: %w", err)
 	}
-	portFile := filepath.Join(opts.ProfileDir, activePortFile)
-	if err := os.Remove(portFile); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("clear stale %s: %w", activePortFile, err)
+	// A browser that was killed leaves its profile lock behind, naming the
+	// host it ran on; after a hostname change Chrome would refuse the
+	// profile. The session manager guarantees exclusive use of the
+	// directory, so stale locks are safe to drop.
+	for _, name := range staleLockFiles {
+		_ = os.Remove(filepath.Join(opts.ProfileDir, name))
 	}
 
+	// The browser reads commands from one pipe and writes messages to the
+	// other.
+	commandsOut, commandsIn, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("create debugging pipe: %w", err)
+	}
+	messagesOut, messagesIn, err := os.Pipe()
+	if err != nil {
+		_ = commandsOut.Close()
+		_ = commandsIn.Close()
+		return nil, fmt.Errorf("create debugging pipe: %w", err)
+	}
+	closeAll := func(files ...*os.File) {
+		for _, f := range files {
+			_ = f.Close()
+		}
+	}
+
+	// Standard error is collected through a pipe of our own rather than by
+	// exec.Cmd: helpers that outlive the browser (its crash handler, its
+	// updater) inherit it, and Cmd.Wait would not report the browser's exit
+	// until the last of them is gone.
+	stderrOut, stderrIn, err := os.Pipe()
+	if err != nil {
+		closeAll(commandsOut, commandsIn, messagesOut, messagesIn)
+		return nil, fmt.Errorf("create output pipe: %w", err)
+	}
 	stderr := &tailBuffer{max: stderrTailSize}
-	argv := append([]string{executable}, launchArgs(opts, r.cfg.ExtraArgs)...)
+	go func() { _, _ = io.Copy(stderr, stderrOut) }()
+	cmd := exec.Command(executable)
+	platform.Prepare(cmd)
+	transport, err := platform.InheritPipe(cmd, commandsOut, messagesIn)
+	if err != nil {
+		closeAll(commandsOut, commandsIn, messagesOut, messagesIn, stderrOut, stderrIn)
+		return nil, err
+	}
+	argv := append([]string{executable}, launchArgs(opts, transport, r.cfg.ExtraArgs)...)
 	if len(r.cfg.Launcher) > 0 {
 		argv = append(append([]string{}, r.cfg.Launcher...), argv...)
 	}
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Stderr = stderr
+	cmd.Path, cmd.Args = argv[0], argv
+	cmd.Stderr = stderrIn
 	cmd.Env = platform.ChildEnv()
-	platform.Prepare(cmd)
-	if err := cmd.Start(); err != nil {
+	err = cmd.Start()
+	// The browser holds its own copies of these ends now.
+	closeAll(commandsOut, messagesIn, stderrIn)
+	if err != nil {
+		closeAll(commandsIn, messagesOut, stderrOut)
 		return nil, fmt.Errorf("start browser: %w", err)
 	}
-	inst := &instance{pid: cmd.Process.Pid, done: make(chan struct{})}
+	inst := &instance{
+		pid:  cmd.Process.Pid,
+		mux:  newMux(commandsIn, messagesOut),
+		done: make(chan struct{}),
+	}
 	go func() {
 		_ = cmd.Wait()
+		inst.mux.Close()
+		_ = messagesOut.Close()
 		close(inst.done)
+		// Let the last of the browser's output arrive, then stop listening
+		// to whatever still holds the pipe.
+		time.Sleep(stderrDrainTimeout)
+		_ = stderrOut.Close()
 	}()
 
-	endpoint, err := waitForEndpoint(ctx, portFile, inst.done)
-	if err != nil {
+	if err := inst.awaitReady(ctx); err != nil {
 		_ = platform.KillTree(inst.pid)
+		// Give the browser's dying words a moment to arrive.
+		waitFor(context.Background(), inst.done, stderrDrainTimeout)
+		time.Sleep(50 * time.Millisecond)
 		if tail := stderr.String(); tail != "" {
 			err = fmt.Errorf("%w; browser output: %s", err, tail)
 		}
 		return nil, err
 	}
-	inst.endpoint = endpoint
 	r.logger.Debug("browser started", "pid", inst.pid, "headless", opts.Headless)
 	return inst, nil
 }
 
-func waitForEndpoint(ctx context.Context, portFile string, exited <-chan struct{}) (string, error) {
-	timeout := time.NewTimer(startupTimeout)
-	defer timeout.Stop()
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
-	for {
-		if endpoint, ok := readEndpoint(portFile); ok {
-			return endpoint, nil
-		}
-		select {
-		case <-ctx.Done():
-			return "", fmt.Errorf("browser launch canceled: %w", ctx.Err())
-		case <-exited:
-			return "", errors.New("browser exited before its CDP endpoint became available")
-		case <-timeout.C:
-			return "", fmt.Errorf("browser did not expose a CDP endpoint within %s", startupTimeout)
-		case <-ticker.C:
-		}
+// awaitReady waits for the browser to answer its first command.
+func (i *instance) awaitReady(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, startupTimeout)
+	defer cancel()
+	_, err := i.mux.call(ctx, "Browser.getVersion", nil)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("browser did not answer on its debugging pipe within %s", startupTimeout)
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("browser launch canceled: %w", err)
+	default:
+		return fmt.Errorf("browser exited before it was ready: %w", err)
 	}
-}
-
-func readEndpoint(portFile string) (string, bool) {
-	data, err := os.ReadFile(portFile)
-	if err != nil {
-		return "", false
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) < 2 {
-		return "", false
-	}
-	port, err := strconv.Atoi(strings.TrimSpace(lines[0]))
-	path := strings.TrimSpace(lines[1])
-	if err != nil || port <= 0 || !strings.HasPrefix(path, "/") {
-		return "", false
-	}
-	return fmt.Sprintf("ws://127.0.0.1:%d%s", port, path), true
 }
 
 // Close shuts the browser down: first politely through CDP so profile data is
@@ -197,15 +236,22 @@ func (r *Runtime) Close(ctx context.Context, bi runtime.BrowserInstance) error {
 	if !ok {
 		return fmt.Errorf("chrome: unexpected instance type %T", bi)
 	}
-	if inst.IsRunning() {
-		if err := requestClose(ctx, inst.endpoint); err != nil {
-			r.logger.Debug("graceful browser close failed", "pid", inst.pid, "error", err)
-		} else {
-			waitFor(ctx, inst.done, gracePeriod)
-		}
+	if !inst.IsRunning() {
+		// The process has been reaped: its ID may already belong to
+		// something else and must not be signalled.
+		return nil
 	}
-	// Always sweep the process group: helper processes can outlive the main
-	// browser process.
+	closeCtx, cancel := context.WithTimeout(ctx, closeRequestTimeout)
+	_, err := inst.mux.call(closeCtx, "Browser.close", nil)
+	cancel()
+	// The browser dropping the pipe as it exits is as good as an answer.
+	if err == nil || errors.Is(err, errBrowserGone) || errors.Is(err, errConnClosed) {
+		if waitFor(ctx, inst.done, gracePeriod) {
+			return nil
+		}
+	} else {
+		r.logger.Debug("graceful browser close failed", "pid", inst.pid, "error", err)
+	}
 	killErr := platform.KillTree(inst.pid)
 	if !waitFor(ctx, inst.done, killTimeout) {
 		return errors.Join(fmt.Errorf("browser process %d did not exit", inst.pid), killErr)
@@ -226,43 +272,15 @@ func waitFor(ctx context.Context, done <-chan struct{}, d time.Duration) bool {
 	}
 }
 
-// loopbackClient never uses a proxy: CDP endpoints are always on loopback.
-var loopbackClient = &http.Client{Transport: &http.Transport{Proxy: nil}}
-
-// requestClose asks the browser to shut itself down and waits until it has
-// taken the request (it answers, or drops the connection as it exits), so
-// that the shutdown is orderly and profile data gets flushed.
-func requestClose(ctx context.Context, endpoint string) error {
-	ctx, cancel := context.WithTimeout(ctx, closeRequestTimeout)
-	defer cancel()
-	conn, _, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{HTTPClient: loopbackClient})
-	if err != nil {
-		return err
-	}
-	defer conn.CloseNow() //nolint:errcheck // best effort
-	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"id":1,"method":"Browser.close"}`)); err != nil {
-		return err
-	}
-	for {
-		_, reply, err := conn.Read(ctx)
-		if err != nil {
-			// The browser closing the connection is the expected outcome.
-			return nil
-		}
-		if bytes.Contains(reply, []byte(`"id":1`)) {
-			return nil
-		}
-	}
-}
-
 type instance struct {
-	pid      int
-	endpoint string
-	done     chan struct{}
+	pid  int
+	mux  *mux
+	done chan struct{}
 }
 
-func (i *instance) CDPEndpoint() string { return i.endpoint }
-func (i *instance) PID() int            { return i.pid }
+// Connect implements runtime.BrowserInstance.
+func (i *instance) Connect(ctx context.Context) (runtime.CDPConn, error) { return i.mux.Connect(ctx) }
+func (i *instance) PID() int                                             { return i.pid }
 func (i *instance) IsRunning() bool {
 	select {
 	case <-i.done:

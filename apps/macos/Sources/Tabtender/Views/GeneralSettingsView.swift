@@ -12,16 +12,21 @@ struct GeneralSettingsView: View {
                     HStack(spacing: 8) {
                         ServiceActionButton()
                         if model.registration == .enabled {
-                            Button("Unregister") { Task { await model.unregisterService() } }
+                            Button("Unregister") {
+                                if SessionLossConfirmation.confirm("Unregister", model: model) {
+                                    Task { await model.unregisterService() }
+                                }
+                            }
                                 .disabled(model.isChangingService)
                         }
                     }
                 } label: {
-                    SettingLabel(title: "Background service", caption: serviceCaption)
+                    SettingLabel(
+                        title: "Background service",
+                        caption: model.serviceState.explanation ?? model.serviceState.displayName
+                    )
                 }
-                if let error = model.actionError {
-                    Banner.error(error)
-                }
+                ActionErrorBanner(kind: .service)
             }
         } content: { $config, snapshot in
             Section {
@@ -33,20 +38,9 @@ struct GeneralSettingsView: View {
                     TextField(text: $config.server.host, prompt: Text("127.0.0.1")) { label }
                 }
                 SettingRow(title: "Port", key: "server.port", snapshot: snapshot) { label in
-                    TextField(value: $config.server.port, format: .number.grouping(.never)) { label }
+                    IntegerField(value: $config.server.port) { label }
                 }
             }
-        }
-    }
-
-    private var serviceCaption: String {
-        switch model.serviceState {
-        case .running, .stopped, .notRegistered:
-            return model.serviceState.displayName
-        case .requiresApproval:
-            return "Allow Tabtender in System Settings > General > Login Items"
-        case .unavailable:
-            return "Run Tabtender from its app bundle to install the service"
         }
     }
 }

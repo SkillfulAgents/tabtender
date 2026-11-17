@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -39,7 +39,13 @@ type fakeBackend struct {
 
 func (b *fakeBackend) Config() config.Snapshot      { return b.store.Snapshot() }
 func (b *fakeBackend) RunningConfig() config.Config { return b.running }
-func (b *fakeBackend) UpdateConfig(file config.Config) (config.Snapshot, error) {
+func (b *fakeBackend) UpdateConfig(edit func(*config.Config) error) (config.Snapshot, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	file := b.store.Snapshot().File
+	if err := edit(&file); err != nil {
+		return config.Snapshot{}, err
+	}
 	return b.store.Save(file)
 }
 func (b *fakeBackend) TunnelTokenSource() string {
@@ -302,7 +308,7 @@ func TestEveryPublicEndpointRequiresAuthentication(t *testing.T) {
 	if err == nil || resp == nil || resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated CDP dial: err=%v resp=%v", err, resp)
 	}
-	if len(h.rt.Instances()[0].Handshakes()) != 0 {
+	if h.rt.Instances()[0].Connections() != 0 {
 		t.Fatal("an unauthenticated client reached the browser")
 	}
 }
@@ -434,26 +440,24 @@ func TestHealth(t *testing.T) {
 	}
 }
 
-func TestCDPProxyRelaysTextAndBinaryFramesVerbatim(t *testing.T) {
+func TestCDPProxyRelaysMessages(t *testing.T) {
 	h := newHarness(t, nil)
 	s := h.createSession("")
 	conn := h.mustDial(s)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	large := make([]byte, 8<<20) // larger than any default read limit
-	if _, err := rand.Read(large); err != nil {
-		t.Fatal(err)
-	}
+	// Larger than any default read limit, as screenshots and traces are.
+	large := []byte(`{"id":2,"result":{"data":"` + strings.Repeat("A", 8<<20) + `"}}`)
 	messages := []struct {
 		typ  websocket.MessageType
 		data []byte
 	}{
 		{websocket.MessageText, []byte(`{"id":1,"method":"Browser.getVersion"}`)},
-		{websocket.MessageBinary, []byte{0x00, 0xff, 0x10, 0x80}},
-		{websocket.MessageText, []byte("not json at all — the proxy must not care ✓")},
-		{websocket.MessageBinary, large},
-		{websocket.MessageText, []byte("")},
+		{websocket.MessageText, []byte(`{"id":3,"params":{"text":"✓ unicode"}}`)},
+		// CDP is JSON either way; some clients send it in binary frames.
+		{websocket.MessageBinary, []byte(`{"id":4,"method":"Target.getTargets"}`)},
+		{websocket.MessageText, large},
 	}
 	for i, m := range messages {
 		if err := conn.Write(ctx, m.typ, m.data); err != nil {
@@ -463,22 +467,37 @@ func TestCDPProxyRelaysTextAndBinaryFramesVerbatim(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %d: %v", i, err)
 		}
-		if typ != m.typ || !bytes.Equal(data, m.data) {
+		if typ != websocket.MessageText || !bytes.Equal(data, m.data) {
 			t.Fatalf("message %d was altered in transit (type %v, %d bytes)", i, typ, len(data))
 		}
 	}
 }
 
-func TestCDPProxyNeverForwardsCredentials(t *testing.T) {
+func TestCDPProxyRejectsMessagesTheBrowserCannotTake(t *testing.T) {
+	h := newHarness(t, nil)
+	s := h.createSession("")
+	conn := h.mustDial(s)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := conn.Write(ctx, websocket.MessageBinary, []byte{0x00, 0xff}); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := conn.Read(ctx)
+	if websocket.CloseStatus(err) != websocket.StatusInvalidFramePayloadData {
+		t.Fatalf("close = %v, want invalid payload", err)
+	}
+	if got, _ := h.sessions.Get(s.ID); got.Status != sessions.StatusRunning {
+		t.Fatal("a misbehaving client must not end the session")
+	}
+}
+
+func TestEveryCDPClientGetsItsOwnBrowserConnection(t *testing.T) {
 	h := newHarness(t, nil)
 	s := h.createSession("")
 	h.mustDial(s)
-	handshakes := h.rt.Instances()[0].Handshakes()
-	if len(handshakes) != 1 {
-		t.Fatalf("browser saw %d handshakes", len(handshakes))
-	}
-	if got := handshakes[0].Get("Authorization"); got != "" {
-		t.Fatalf("the API key was forwarded to the browser: %q", got)
+	h.mustDial(s)
+	if got := h.rt.Instances()[0].Connections(); got != 2 {
+		t.Fatalf("the browser saw %d connections, want 2", got)
 	}
 }
 
@@ -572,12 +591,6 @@ func TestSessionTokenConnectsWithoutAHeader(t *testing.T) {
 	if _, data, err := conn.Read(ctx); err != nil || string(data) != "hello" {
 		t.Fatalf("echo through a token-authenticated connection: %q %v", data, err)
 	}
-	// The token is consumed by the proxy and never forwarded to the browser.
-	for _, handshake := range h.rt.Instances()[0].Handshakes() {
-		if handshake.Get("Authorization") != "" {
-			t.Fatal("credentials were forwarded to the browser")
-		}
-	}
 	// Header authentication keeps working, with or without the token.
 	if got := h.dialStatus(withoutToken(s.CDPURL), h.keys.Key()); got != http.StatusSwitchingProtocols {
 		t.Fatalf("header-authenticated dial: %d", got)
@@ -609,7 +622,7 @@ func TestSessionTokenIsScopedToItsOwnSession(t *testing.T) {
 			t.Errorf("%s: missing WWW-Authenticate header", name)
 		}
 	}
-	if len(h.rt.Instances()[0].Handshakes()) != 0 {
+	if h.rt.Instances()[0].Connections() != 0 {
 		t.Fatal("an unauthorized client reached session A's browser")
 	}
 }
@@ -765,24 +778,32 @@ func TestSessionTokensAreNeverLogged(t *testing.T) {
 	}
 }
 
-func TestBrowserInitiatedCloseIsPropagated(t *testing.T) {
+func TestLosingTheBrowserConnectionClosesTheClient(t *testing.T) {
 	h := newHarness(t, nil)
 	s := h.createSession("")
 	conn := h.mustDial(s)
 	inst := h.rt.Instances()[0]
-	eventually(t, "the browser to see the client", func() bool { return len(inst.Handshakes()) == 1 })
-	time.Sleep(50 * time.Millisecond) // let the echo loop register the connection
-	inst.CloseClients(websocket.StatusCode(4321), "custom reason")
+	eventually(t, "the browser to see the client", func() bool { return inst.Connections() == 1 })
+	inst.DropClients()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_, _, err := conn.Read(ctx)
 	var ce websocket.CloseError
-	if !errors.As(err, &ce) || ce.Code != 4321 || ce.Reason != "custom reason" {
-		t.Fatalf("close = %v, want code 4321 with the browser's reason", err)
+	if !errors.As(err, &ce) || ce.Code != websocket.StatusGoingAway || ce.Reason != "browser disconnected" {
+		t.Fatalf("close = %v, want going away: browser disconnected", err)
 	}
 	if got, _ := h.sessions.Get(s.ID); got.Status != sessions.StatusRunning {
 		t.Fatal("a closed CDP connection must not end the session")
+	}
+}
+
+func TestUnreachableBrowserIsReported(t *testing.T) {
+	h := newHarness(t, nil)
+	s := h.createSession("")
+	h.rt.Instances()[0].FailConnect(errors.New("no pipe"))
+	if got := h.dialStatus(s.CDPURL, ""); got != http.StatusBadGateway {
+		t.Fatalf("dial = %d, want 502", got)
 	}
 }
 
@@ -847,13 +868,71 @@ func TestCDPURLSelection(t *testing.T) {
 	}
 
 	// An operator-pinned public URL always wins.
-	file := h.backend.Config().File
-	file.Server.PublicURL = "https://browsers.example.com/"
-	if _, err := h.backend.UpdateConfig(file); err != nil {
+	pin := func(file *config.Config) error {
+		file.Server.PublicURL = "https://browsers.example.com/"
+		return nil
+	}
+	if _, err := h.backend.UpdateConfig(pin); err != nil {
 		t.Fatal(err)
 	}
 	if got := get("Host", "127.0.0.1:3000"); got != "wss://browsers.example.com" {
 		t.Errorf("pinned public URL: %q", got)
+	}
+}
+
+func TestRejectedConfigUpdateLeavesNoTrace(t *testing.T) {
+	h := newHarness(t, nil)
+	put := func(body string) int {
+		return h.manage(http.MethodPut, "/mgmt/v1/config", body).status
+	}
+	extraArgs := func() []string {
+		snap := h.backend.Config()
+		if !slices.Equal(snap.File.Browser.ExtraArgs, snap.Effective.Browser.ExtraArgs) {
+			t.Fatalf("file %v and effective %v disagree", snap.File.Browser.ExtraArgs, snap.Effective.Browser.ExtraArgs)
+		}
+		return snap.File.Browser.ExtraArgs
+	}
+	if got := put(`{"browser":{"extraArgs":["--a","--b"]}}`); got != http.StatusOK {
+		t.Fatalf("status %d", got)
+	}
+	// Valid JSON, invalid configuration: nothing of it may stick.
+	if got := put(`{"browser":{"extraArgs":["--x"]},"sessions":{"maxConcurrent":0}}`); got != http.StatusBadRequest {
+		t.Fatalf("status %d", got)
+	}
+	if got := extraArgs(); !slices.Equal(got, []string{"--a", "--b"}) {
+		t.Fatalf("a rejected update changed the configuration: %v", got)
+	}
+	if got := put(`{"sessions":{"maxConcurrent":3}}`); got != http.StatusOK {
+		t.Fatalf("status %d", got)
+	}
+	if got := extraArgs(); !slices.Equal(got, []string{"--a", "--b"}) {
+		t.Fatalf("a rejected update leaked into a later one: %v", got)
+	}
+	// Editing a snapshot never reaches the stored configuration either.
+	h.backend.Config().File.Browser.ExtraArgs[0] = "--tampered"
+	if got := extraArgs(); got[0] != "--a" {
+		t.Fatalf("a snapshot shares memory with the store: %v", got)
+	}
+}
+
+func TestSessionTokenIgnoresEncodedPaths(t *testing.T) {
+	h := newHarness(t, nil)
+	s := h.createSession("")
+	token := tokenOf(t, s.CDPURL)
+	for _, path := range []string{
+		"/v1/sessions/" + s.ID + "%2Fcdp",
+		"/v1/sessions%2F" + s.ID + "/cdp",
+		"/v1%2Fsessions/" + s.ID + "/cdp",
+		"/v1/sessions/" + s.ID + "/%63dp",
+	} {
+		if got := h.do(h.public.URL, http.MethodGet, path+"?token="+token, "", "").status; got != http.StatusUnauthorized {
+			t.Errorf("%s: status %d, want 401", path, got)
+		}
+	}
+	// A "?" encoded into the path would otherwise carry the token into the log.
+	h.do(h.public.URL, http.MethodGet, "/v1/sessions/"+s.ID+"/cdp%3Ftoken="+token, "", "")
+	if strings.Contains(h.logText.String(), token) {
+		t.Fatalf("the session token appears in the log:\n%s", h.logText.String())
 	}
 }
 

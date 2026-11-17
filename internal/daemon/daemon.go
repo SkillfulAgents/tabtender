@@ -100,6 +100,11 @@ func Run(ctx context.Context, opts Options) error {
 	if err := os.MkdirAll(paths.DataDir, 0o700); err != nil {
 		return fmt.Errorf("create data directory: %w", err)
 	}
+	// A directory that already existed keeps its mode; make sure nobody
+	// else can so much as list it.
+	if err := os.Chmod(paths.DataDir, 0o700); err != nil {
+		return fmt.Errorf("restrict data directory: %w", err)
+	}
 	logger, logBuffer, logCloser, err := logging.Setup(paths.LogFile(), logLevel(opts.LookupEnv), opts.Stderr)
 	if err != nil {
 		return err
@@ -216,7 +221,14 @@ func run(ctx context.Context, opts Options, paths config.Paths, logger *slog.Log
 		ListenAddr: listenAddr,
 	})
 
-	public := &http.Server{Handler: server.PublicHandler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
+	// Request bodies are bounded by the handlers; a server-wide
+	// ReadTimeout would also cancel requests that are slow to answer, such
+	// as a session whose browser takes long to start.
+	public := &http.Server{
+		Handler:           server.PublicHandler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
 	servers := []*http.Server{public}
 	serveErr := make(chan error, 2)
 	go func() { serveErr <- public.Serve(listener) }()
@@ -231,7 +243,11 @@ func run(ctx context.Context, opts Options, paths config.Paths, logger *slog.Log
 			return err
 		}
 		defer os.Remove(socket) //nolint:errcheck // best-effort cleanup
-		mgmt := &http.Server{Handler: server.ManagementHandler(), ReadHeaderTimeout: 10 * time.Second}
+		mgmt := &http.Server{
+			Handler:           server.ManagementHandler(),
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       2 * time.Minute,
+		}
 		servers = append(servers, mgmt)
 		go func() { serveErr <- mgmt.Serve(mgmtListener) }()
 		logger.Info("management channel ready", "socket", socket)
@@ -268,7 +284,7 @@ func run(ctx context.Context, opts Options, paths config.Paths, logger *slog.Log
 		_ = srv.Shutdown(httpCtx)
 		httpCancel()
 	}
-	d.tunnels.Stop()
+	d.tunnels.Close()
 	if opts.Launchd && ctx.Err() != nil {
 		service.ClearManualStart(paths.StateDir())
 	}
@@ -384,9 +400,14 @@ func (d *Daemon) RunningConfig() config.Config { return d.running }
 
 // UpdateConfig implements api.Backend: it persists the new file layer and
 // applies every setting that can change without a restart.
-func (d *Daemon) UpdateConfig(file config.Config) (config.Snapshot, error) {
+func (d *Daemon) UpdateConfig(edit func(*config.Config) error) (config.Snapshot, error) {
 	d.applyMu.Lock()
 	defer d.applyMu.Unlock()
+
+	file := d.store.Snapshot().File
+	if err := edit(&file); err != nil {
+		return config.Snapshot{}, err
+	}
 
 	// Validate everything — values and adapter choices — before anything is
 	// written to disk, and report all problems at once.

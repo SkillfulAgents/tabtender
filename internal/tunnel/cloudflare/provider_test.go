@@ -400,3 +400,30 @@ func TestEveryReleasePlatformHasAPinnedAsset(t *testing.T) {
 		}
 	}
 }
+
+func TestSupersededDownloadsAreRemoved(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "cloudflared-current")
+	keep := []string{current, filepath.Join(dir, "unrelated.txt")}
+	stale := []string{
+		filepath.Join(dir, "cloudflared-2020.1.0"),
+		filepath.Join(dir, downloadPrefix+"123"),
+		filepath.Join(dir, downloadPrefix+"123.bin"),
+	}
+	for _, path := range append(append([]string{}, keep...), stale...) {
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removeSuperseded(dir, current)
+	for _, path := range keep {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s was removed", filepath.Base(path))
+		}
+	}
+	for _, path := range stale {
+		if _, err := os.Stat(path); err == nil {
+			t.Errorf("%s was left behind", filepath.Base(path))
+		}
+	}
+}

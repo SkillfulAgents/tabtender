@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -86,5 +87,52 @@ func TestRotation(t *testing.T) {
 	}
 	if current.Size() != 1<<20 || previous.Size() != 10<<20 {
 		t.Fatalf("sizes after rotation: current=%d previous=%d", current.Size(), previous.Size())
+	}
+}
+
+func TestRotationSurvivesFailures(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directories cannot stand in for unwritable files the same way on Windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rotating.log")
+	rf, err := openRotating(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rf.Close() //nolint:errcheck // test cleanup
+	chunk := bytes.Repeat([]byte("x"), 1<<20)
+	for range 11 {
+		if _, err := rf.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The previous generation cannot be replaced: a non-empty directory
+	// sits in its place.
+	if err := os.Remove(path + ".1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(path+".1", "blocker"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for range 12 {
+		if _, err := rf.Write(chunk); err != nil {
+			t.Fatalf("logging stopped when rotation failed: %v", err)
+		}
+	}
+	if info, err := os.Stat(path); err != nil || info.Size() != 13<<20 {
+		t.Fatalf("records were lost when rotation failed: %v %v", info, err)
+	}
+	// Once the obstacle is gone, rotation resumes.
+	if err := os.RemoveAll(path + ".1"); err != nil {
+		t.Fatal(err)
+	}
+	for range 11 {
+		if _, err := rf.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if info, err := os.Stat(path + ".1"); err != nil || info.IsDir() {
+		t.Fatalf("rotation did not resume: %v", err)
 	}
 }

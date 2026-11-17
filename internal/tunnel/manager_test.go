@@ -187,3 +187,39 @@ func TestRegistry(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 }
+
+func TestManagerBacksOffBetweenFailedStarts(t *testing.T) {
+	p := &scriptedProvider{failures: 1 << 30}
+	m := newTestManager(t, map[string]*scriptedProvider{"flaky": p})
+	m.SetRetryDelay(10 * time.Millisecond)
+	if err := m.Apply("flaky", TunnelConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	// Doubling pauses of 10, 20, 40, 80 and 160 ms allow five attempts in
+	// 250 ms; a fixed 10 ms pause would allow about twenty-five.
+	time.Sleep(250 * time.Millisecond)
+	if starts, _ := p.counts(); starts < 3 || starts > 7 {
+		t.Fatalf("%d start attempts in 250ms, want a handful", starts)
+	}
+}
+
+func TestManagerRefusesProvidersAfterClose(t *testing.T) {
+	p := &scriptedProvider{url: "https://a.example"}
+	m := newTestManager(t, map[string]*scriptedProvider{"a": p})
+	if err := m.Apply("a", TunnelConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the provider to run", func() bool { return m.PublicURL() != "" })
+	m.Close()
+	if _, stops := p.counts(); stops != 1 || m.PublicURL() != "" {
+		t.Fatalf("the provider was not stopped: stops=%d", stops)
+	}
+	// A configuration change racing with shutdown must not start a tunnel
+	// that nothing would ever stop.
+	if err := m.Apply("a", TunnelConfig{}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Apply after Close: %v", err)
+	}
+	if starts, _ := p.counts(); starts != 1 {
+		t.Fatalf("a provider was started after Close (%d starts)", starts)
+	}
+}

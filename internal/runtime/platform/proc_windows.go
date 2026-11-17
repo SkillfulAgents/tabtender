@@ -3,6 +3,7 @@ package platform
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"syscall"
@@ -64,4 +65,24 @@ func ContainDescendants() error {
 	// The handle is intentionally leaked: it must stay open for the lifetime
 	// of the daemon and is closed by the OS at exit, which triggers the kill.
 	return nil
+}
+
+// InheritPipe hands the child process the two pipe ends of a browser
+// debugging pipe (commands are read from in, messages written to out) and
+// returns the browser flags that select them. Windows has no numbered file
+// descriptors to inherit, so the handles are made inheritable and named on
+// the command line; an inherited handle keeps its value in the child.
+// Prepare must have been called on cmd first.
+func InheritPipe(cmd *exec.Cmd, in, out *os.File) ([]string, error) {
+	handles := []syscall.Handle{syscall.Handle(in.Fd()), syscall.Handle(out.Fd())}
+	for _, h := range handles {
+		if err := windows.SetHandleInformation(windows.Handle(h), windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); err != nil {
+			return nil, fmt.Errorf("make pipe handle inheritable: %w", err)
+		}
+	}
+	cmd.SysProcAttr.AdditionalInheritedHandles = append(cmd.SysProcAttr.AdditionalInheritedHandles, handles...)
+	return []string{
+		"--remote-debugging-pipe",
+		fmt.Sprintf("--remote-debugging-io-pipes=%d,%d", handles[0], handles[1]),
+	}, nil
 }

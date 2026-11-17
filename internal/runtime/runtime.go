@@ -5,6 +5,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -43,10 +44,27 @@ type BrowserRuntime interface {
 
 // BrowserInstance is one running browser process.
 type BrowserInstance interface {
-	// CDPEndpoint is the loopback WebSocket URL of the browser's CDP endpoint.
-	CDPEndpoint() string
+	// Connect opens a CDP connection to the browser. Connections are
+	// independent of each other: each sees the browser as a client that
+	// connected on its own would.
+	Connect(ctx context.Context) (CDPConn, error)
 	PID() int
 	IsRunning() bool
+}
+
+// ErrInvalidMessage is returned by CDPConn.Write for a message that is not a
+// CDP message (a JSON object).
+var ErrInvalidMessage = errors.New("not a valid CDP message")
+
+// CDPConn is a browser-level CDP connection. Read and Write may be used
+// concurrently with each other.
+type CDPConn interface {
+	// Read returns the next message from the browser.
+	Read(ctx context.Context) ([]byte, error)
+	// Write sends one message to the browser.
+	Write(ctx context.Context, msg []byte) error
+	// Close ends the connection. The browser keeps running.
+	Close() error
 }
 
 // BrowserRuntimeFactory creates runtimes by kind.

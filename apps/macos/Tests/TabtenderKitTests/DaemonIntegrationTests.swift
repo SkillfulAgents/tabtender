@@ -56,6 +56,13 @@ final class DaemonIntegrationTests: DaemonTestCase {
         XCTAssertEqual(health.sessions, status.sessions)
     }
 
+    func testIdentityMatchesStatus() async throws {
+        let daemon = try await launchDaemon()
+        let status = try await daemon.client.status()
+        let identity = try await daemon.client.identity()
+        XCTAssertEqual(identity, DaemonIdentity(version: status.version, pid: daemon.pid))
+    }
+
     // MARK: Configuration
 
     func testConfigEditsPersistAcrossDaemonRestart() async throws {
@@ -96,6 +103,27 @@ final class DaemonIntegrationTests: DaemonTestCase {
         XCTAssertEqual(persisted.pendingRestart, [])
         let restarted = try await second.client.status()
         XCTAssertEqual(restarted.sessions.max, 5)
+    }
+
+    func testSavingEditsKeepsSettingsChangedElsewhere() async throws {
+        let daemon = try await launchDaemon()
+        let loaded = try await daemon.client.config().file
+
+        // Another client changes a setting after the draft was loaded.
+        var elsewhere = loaded
+        elsewhere.sessions.defaultTTL = 600
+        elsewhere.browser.headless = true
+        _ = try await daemon.client.updateConfig(elsewhere)
+
+        var draft = loaded
+        draft.sessions.maxConcurrent = 5
+        let saved = try await daemon.client.updateConfig(draft, changedFrom: loaded)
+
+        var expected = elsewhere
+        expected.sessions.maxConcurrent = 5
+        XCTAssertEqual(saved.file, expected)
+        let reread = try await daemon.client.config()
+        XCTAssertEqual(reread.file, expected)
     }
 
     func testInvalidConfigIsRejectedWithTypedError() async throws {

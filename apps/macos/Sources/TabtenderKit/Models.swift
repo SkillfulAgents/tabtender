@@ -24,6 +24,20 @@ public struct DaemonStatus: Codable, Equatable, Sendable {
     public var pendingRestart: [String]
 }
 
+/// The part of `GET /mgmt/v1/status` that identifies the running daemon.
+///
+/// Decoded on its own so that a daemon from another release, whose full
+/// status this app may not understand, can still be recognized and replaced.
+public struct DaemonIdentity: Codable, Equatable, Sendable {
+    public var version: String
+    public var pid: Int32
+
+    public init(version: String, pid: Int32) {
+        self.version = version
+        self.pid = pid
+    }
+}
+
 /// `GET /v1/health`.
 public struct HealthStatus: Codable, Equatable, Sendable {
     /// "ok" or "degraded".

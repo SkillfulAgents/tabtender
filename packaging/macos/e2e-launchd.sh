@@ -3,8 +3,9 @@
 #
 # Registers the LaunchAgent embedded in Tabtender.app through SMAppService,
 # drives real browser sessions through the launchd-managed daemon, and checks
-# the lifecycle guarantees: the GUI can come and go, launchd restarts the
-# daemon after a crash, stop/start work, and app.startOnLogin is honored.
+# the lifecycle guarantees: opening the app for the first time sets the
+# service up, the GUI can come and go, launchd restarts the daemon after a
+# crash, stop/start work, and app.startOnLogin is honored.
 #
 # Usage: packaging/macos/e2e-launchd.sh [path/to/Tabtender.app]
 #
@@ -16,6 +17,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 APP="$(cd "${1:-$ROOT/dist/Tabtender.app}" && pwd)"
 GUI="$APP/Contents/MacOS/Tabtender"
+BUNDLE_ID="com.skillfulagents.tabtender"
 LABEL="com.skillfulagents.tabtender.daemon"
 TARGET="gui/$(id -u)/$LABEL"
 SOCKET="$HOME/Library/Application Support/Tabtender/tabtenderd.sock"
@@ -39,6 +41,8 @@ wait_until() { # description timeout-seconds command...
 }
 daemon_up() { [ -n "$(daemon_pid)" ]; }
 daemon_down() { [ -z "$(daemon_pid)" ]; }
+service_unloaded() { ! launchctl print "$TARGET"; }
+first_launch_completed() { [ "$(defaults read "$BUNDLE_ID" didCompleteFirstLaunch)" = 1 ]; }
 
 # Replaces the daemon inside the app with a different build and re-signs the
 # bundle, as an app update does.
@@ -63,6 +67,25 @@ cleanup() {
 	exit $status
 }
 trap cleanup EXIT
+
+step "First launch: opening the app registers and starts the service"
+# What a new user does: open the app on a Mac where it has never run and its
+# service was never registered. Everything after this step drives the service
+# through the command-line flags, which would hide a broken first launch.
+"$GUI" --unregister-service
+wait_until "any earlier daemon to stop" 30 daemon_down
+defaults delete "$BUNDLE_ID" didCompleteFirstLaunch 2>/dev/null || true
+"$GUI" --service-status
+open -g "$APP"
+wait_until "the first launch to start the daemon" 90 daemon_up
+wait_until "the first launch to be recorded" 20 first_launch_completed
+launchctl print "$TARGET" | grep -q "state = running" || fail "launchd does not report the service as running"
+echo "first launch started tabtenderd as pid $(daemon_pid)"
+pkill -f "$GUI\$"
+wait_until "the menu-bar app to exit" 10 sh -c "! pgrep -f '$GUI\$'"
+"$GUI" --unregister-service
+wait_until "the daemon to stop" 30 daemon_down
+wait_until "launchd to drop the service" 30 service_unloaded
 
 step "Register the service through SMAppService"
 "$GUI" --register-service

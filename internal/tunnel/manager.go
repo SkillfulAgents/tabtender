@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -15,8 +16,14 @@ type Manager struct {
 	factory   TunnelFactory
 	localPort int
 	logger    *slog.Logger
-	// RetryDelay is the pause between failed start attempts.
+	// retryDelay is the pause after the first failed start attempt; it
+	// doubles with every further failure, up to maxRetryDelay.
 	retryDelay time.Duration
+
+	// opMu serializes provider changes, so a provider can never be started
+	// while another change — or the final stop — is tearing one down.
+	opMu   sync.Mutex
+	closed bool
 
 	mu       sync.Mutex
 	kind     string
@@ -42,7 +49,15 @@ func NewManager(factory TunnelFactory, localPort int, logger *slog.Logger) *Mana
 	}
 }
 
-// SetRetryDelay overrides the pause between failed start attempts.
+// maxRetryDelay caps the pause between start attempts. A provider that keeps
+// failing (no network, a missing token, a download that never verifies) is
+// retried indefinitely, but not in a tight loop.
+const maxRetryDelay = 10 * time.Minute
+
+// ErrClosed is returned when a provider is applied after Close.
+var ErrClosed = errors.New("tunnel manager is closed")
+
+// SetRetryDelay overrides the pause after the first failed start attempt.
 func (m *Manager) SetRetryDelay(d time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -52,6 +67,11 @@ func (m *Manager) SetRetryDelay(d time.Duration) {
 // Apply stops the current provider and starts the requested one in the
 // background. It returns an error only if the provider cannot be created.
 func (m *Manager) Apply(kind string, cfg TunnelConfig) error {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	if m.closed {
+		return ErrClosed
+	}
 	provider, err := m.factory.Create(kind, cfg)
 	if err != nil {
 		return err
@@ -99,6 +119,7 @@ func (m *Manager) run(ctx context.Context, done chan struct{}, kind string, prov
 			return
 		case <-time.After(retryDelay):
 		}
+		retryDelay = min(retryDelay*2, max(maxRetryDelay, retryDelay))
 		m.mu.Lock()
 		if m.provider == provider {
 			m.starting = true
@@ -133,6 +154,21 @@ func (m *Manager) Restart(cfg TunnelConfig) error {
 
 // Stop shuts the active provider down and reverts to local-only access.
 func (m *Manager) Stop() {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	m.stopLocked()
+}
+
+// Close stops the active provider for good: later Apply calls fail with
+// ErrClosed.
+func (m *Manager) Close() {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	m.closed = true
+	m.stopLocked()
+}
+
+func (m *Manager) stopLocked() {
 	m.stopCurrent()
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -84,8 +84,30 @@ func resolveBinary(ctx context.Context, configured, binDir string) (string, erro
 	if err := download(ctx, downloadBase+Version+"/"+a.name, a, managed); err != nil {
 		return "", fmt.Errorf("download cloudflared %s: %w", Version, err)
 	}
+	removeSuperseded(binDir, managed)
 	return managed, nil
 }
+
+// removeSuperseded deletes what earlier downloads left in binDir: binaries
+// of other versions and the remains of interrupted downloads.
+func removeSuperseded(binDir, current string) {
+	entries, err := os.ReadDir(binDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		name, path := entry.Name(), filepath.Join(binDir, entry.Name())
+		stale := strings.HasPrefix(name, "cloudflared-") || strings.HasPrefix(name, downloadPrefix)
+		if stale && path != current && !entry.IsDir() {
+			_ = os.Remove(path)
+		}
+	}
+}
+
+const (
+	downloadPrefix  = ".cloudflared-download-"
+	maxDownloadSize = 256 << 20
+)
 
 func isFile(path string) bool {
 	info, err := os.Stat(path)
@@ -113,13 +135,14 @@ func download(ctx context.Context, url string, a asset, dest string) error {
 		return fmt.Errorf("unexpected HTTP status %s", resp.Status)
 	}
 
-	tmp, err := os.CreateTemp(filepath.Dir(dest), ".cloudflared-download-*")
+	tmp, err := os.CreateTemp(filepath.Dir(dest), downloadPrefix+"*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name()) //nolint:errcheck // best-effort cleanup
 	hash := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(tmp, hash), resp.Body); err != nil {
+	// The limit only guards the disk; a truncated body fails the checksum.
+	if _, err := io.Copy(io.MultiWriter(tmp, hash), io.LimitReader(resp.Body, maxDownloadSize)); err != nil {
 		_ = tmp.Close()
 		return err
 	}

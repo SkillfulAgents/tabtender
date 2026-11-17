@@ -37,9 +37,15 @@ enum ServiceCommand: String {
             case .stop:
                 return try await stop(service, client)
             case .status:
-                let daemon = try? await client.status()
                 print("service: \(service.registrationStatus.rawValue)")
-                print("daemon: \(daemon.map { "running (pid \($0.pid), version \($0.version))" } ?? "not running")")
+                do {
+                    let daemon = try await client.identity()
+                    print("daemon: running (pid \(daemon.pid), version \(daemon.version))")
+                } catch ManagementError.notRunning {
+                    print("daemon: not running")
+                } catch {
+                    print("daemon: not responding (\(error.localizedDescription))")
+                }
                 return 0
             }
         } catch {
@@ -54,7 +60,7 @@ enum ServiceCommand: String {
             return 0
         }
         do {
-            _ = try await service.registerVerified { (try? await client.status()) != nil }
+            _ = try await service.registerVerified { try? await client.identity() }
         } catch where service.registrationStatus == .requiresApproval {
             print("service registered, but it must be allowed in System Settings > General > Login Items")
             return 2
@@ -67,7 +73,8 @@ enum ServiceCommand: String {
     }
 
     private func unregister(_ service: ServiceController) throws -> Int32 {
-        if service.registrationStatus == .notRegistered {
+        // An agent that was never registered is reported as not found.
+        if [.notRegistered, .notFound].contains(service.registrationStatus) {
             print("service not registered")
             return 0
         }
@@ -77,7 +84,9 @@ enum ServiceCommand: String {
     }
 
     private func start(_ service: ServiceController, _ client: ManagementClient) async throws -> Int32 {
-        if (try? await client.status()) != nil {
+        // Fails for a daemon that is running but not answering: the repair
+        // below would otherwise kill it and its sessions.
+        if try await runningDaemon(client) != nil {
             print("daemon already running")
             return 0
         }
@@ -85,16 +94,28 @@ enum ServiceCommand: String {
         if await reportStarted(client, prefix: "service started", timeout: Self.startTimeout) == 0 {
             return 0
         }
+        if let daemon = try await runningDaemon(client) {
+            print("service started; daemon running (pid \(daemon.pid))")
+            return 0
+        }
         // launchd only spawns the build the service was registered with;
         // a registration left over from another build has to be replaced.
         print("replacing a stale service registration")
-        _ = try await service.repairRegistration { (try? await client.status()) != nil }
+        _ = try await service.repairRegistration { try? await client.identity() }
         return await reportStarted(client, prefix: "service registered again", timeout: 2)
     }
 
     private func stop(_ service: ServiceController, _ client: ManagementClient) async throws -> Int32 {
-        guard let daemon = try? await client.status() else {
-            print("daemon not running")
+        let daemon: DaemonIdentity
+        do {
+            guard let running = try await runningDaemon(client) else {
+                print("daemon not running")
+                return 0
+            }
+            daemon = running
+        } catch {
+            try service.stop()
+            print("stop requested; the daemon was not responding (\(error.localizedDescription))")
             return 0
         }
         try service.stop()
@@ -106,6 +127,16 @@ enum ServiceCommand: String {
         return 0
     }
 
+    /// The daemon answering on the management socket, or `nil` when nothing
+    /// is listening. Throws when a daemon is there but does not answer.
+    private func runningDaemon(_ client: ManagementClient) async throws -> DaemonIdentity? {
+        do {
+            return try await client.identity()
+        } catch ManagementError.notRunning {
+            return nil
+        }
+    }
+
     private func reportStarted(
         _ client: ManagementClient,
         prefix: String,
@@ -113,7 +144,7 @@ enum ServiceCommand: String {
     ) async -> Int32 {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if let daemon = try? await client.status() {
+            if let daemon = try? await client.identity() {
                 print("\(prefix); daemon running (pid \(daemon.pid))")
                 return 0
             }

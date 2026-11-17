@@ -104,6 +104,40 @@ test('clients can disconnect and reconnect without losing the session', async ()
   }
 });
 
+test('several clients share a session without disturbing each other', async () => {
+  const session = await createSession();
+  try {
+    const first = await chromium.connectOverCDP(session.cdpUrl);
+    const firstPage = await first.contexts()[0].newPage();
+    await firstPage.goto(`${site.url}/first`);
+
+    // A second client joins while the first is at work, and sees its page.
+    const second = await chromium.connectOverCDP(session.cdpUrl);
+    assert.equal((await api('GET', `/v1/sessions/${session.id}`)).body.connectedClients, 2);
+    const seen = second.contexts()[0].pages().map((p) => p.url());
+    assert.ok(seen.some((url) => url.endsWith('/first')), `second client sees: ${seen}`);
+    const secondPage = await second.contexts()[0].newPage();
+    await secondPage.goto(`${site.url}/second`);
+
+    // Both keep working side by side.
+    const [a, b] = await Promise.all([
+      firstPage.evaluate(() => location.pathname),
+      secondPage.evaluate(() => location.pathname),
+    ]);
+    assert.deepEqual([a, b], ['/first', '/second']);
+
+    // One leaving does not affect the other, nor the pages it opened.
+    await first.close();
+    assert.equal(await secondPage.evaluate(() => 40 + 2), 42);
+    await waitFor(async () => (await api('GET', `/v1/sessions/${session.id}`)).body.connectedClients === 1);
+    const remaining = second.contexts()[0].pages().map((p) => p.url());
+    assert.ok(remaining.some((url) => url.endsWith('/first')), `pages after the first client left: ${remaining}`);
+    await second.close();
+  } finally {
+    await deleteSession(session.id);
+  }
+});
+
 test('sessions do not share cookies or storage', async () => {
   const [a, b] = await Promise.all([createSession(), createSession()]);
   try {

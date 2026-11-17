@@ -6,10 +6,11 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/coder/websocket"
+
+	"github.com/SkillfulAgents/tabtender/internal/runtime"
 )
 
 const (
@@ -18,25 +19,20 @@ const (
 	keepaliveInterval = 30 * time.Second
 	keepaliveTimeout  = 20 * time.Second
 	closeHandshake    = 3 * time.Second
-	copyBufferSize    = 32 << 10
+	connectTimeout    = 10 * time.Second
+	// sessionEndGrace is how long a lost browser connection waits for the
+	// session to be declared over. It must exceed the interval at which
+	// the session manager notices a browser that exited.
+	sessionEndGrace = 1500 * time.Millisecond
 )
-
-// upstreamClient reaches browser CDP endpoints, which are always on
-// loopback, so proxy settings from the environment must not apply.
-var upstreamClient = &http.Client{Transport: &http.Transport{Proxy: nil}}
-
-var copyBuffers = sync.Pool{New: func() any {
-	buf := make([]byte, copyBufferSize)
-	return &buf
-}}
 
 func isWebSocketUpgrade(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
-// handleCDP bridges a client WebSocket to the session's browser. Messages
-// are relayed verbatim, frame type included, and are never parsed.
+// handleCDP bridges a client WebSocket to a CDP connection of its own on the
+// session's browser.
 func (s *Server) handleCDP(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !isWebSocketUpgrade(r) {
@@ -57,24 +53,22 @@ func (s *Server) handleCDP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
 	defer cancel()
 
-	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
-	upstream, _, err := websocket.Dial(dialCtx, attachment.Endpoint, &websocket.DialOptions{
-		HTTPClient:      upstreamClient,
-		CompressionMode: websocket.CompressionDisabled,
-	})
-	dialCancel()
+	connectCtx, connectCancel := context.WithTimeout(ctx, connectTimeout)
+	browser, err := attachment.Connect(connectCtx)
+	connectCancel()
 	if err != nil {
-		s.Logger.Warn("failed to reach browser CDP endpoint", "session", id, "error", err)
+		s.Logger.Warn("failed to reach the browser", "session", id, "error", err)
 		writeError(w, http.StatusBadGateway, "browser_unreachable", "the session's browser is not reachable")
 		return
 	}
-	defer upstream.CloseNow() //nolint:errcheck // idempotent cleanup
+	defer browser.Close() //nolint:errcheck // idempotent cleanup
 
 	client, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		// Origin checks protect cookie-authenticated endpoints from
-		// cross-site WebSocket hijacking. This endpoint authenticates
-		// with a bearer token that browsers cannot attach to WebSocket
-		// handshakes, so any origin is acceptable.
+		// cross-site WebSocket hijacking. This endpoint is authorized by
+		// a secret the caller must present explicitly (the API key
+		// header or the session token), never by ambient browser
+		// credentials, so any origin is acceptable.
 		InsecureSkipVerify: true,
 		CompressionMode:    websocket.CompressionDisabled,
 	})
@@ -85,23 +79,22 @@ func (s *Server) handleCDP(w http.ResponseWriter, r *http.Request) {
 
 	// CDP messages (screenshots, traces) can be very large.
 	client.SetReadLimit(-1)
-	upstream.SetReadLimit(-1)
 
 	s.Logger.Debug("cdp client connected", "session", id)
-	reason := relay(ctx, client, upstream, attachment.Done)
+	reason := relay(ctx, client, browser, attachment.Done)
 	s.Logger.Debug("cdp client disconnected", "session", id, "reason", reason)
 }
 
 // relay pumps messages in both directions until one side closes or the
-// session ends, then propagates the close to the other side.
-func relay(ctx context.Context, client, upstream *websocket.Conn, sessionDone <-chan struct{}) string {
+// session ends, then closes the other side.
+func relay(ctx context.Context, client *websocket.Conn, browser runtime.CDPConn, sessionDone <-chan struct{}) string {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	clientErr := make(chan error, 1)
-	upstreamErr := make(chan error, 1)
-	go func() { clientErr <- pump(ctx, upstream, client) }()
-	go func() { upstreamErr <- pump(ctx, client, upstream) }()
+	browserErr := make(chan error, 1)
+	go func() { clientErr <- pumpToBrowser(ctx, browser, client) }()
+	go func() { browserErr <- pumpToClient(ctx, client, browser) }()
 	go keepalive(ctx, client, cancel)
 
 	select {
@@ -109,44 +102,49 @@ func relay(ctx context.Context, client, upstream *websocket.Conn, sessionDone <-
 		closeWith(client, websocket.StatusGoingAway, "session terminated")
 		return "session terminated"
 	case err := <-clientErr:
-		code, reason := closeInfo(err)
-		closeWith(upstream, code, reason)
+		if errors.Is(err, runtime.ErrInvalidMessage) {
+			closeWith(client, websocket.StatusInvalidFramePayloadData, "not a CDP message")
+			return "client sent an invalid message"
+		}
 		return "client closed: " + describe(err)
-	case err := <-upstreamErr:
+	case err := <-browserErr:
 		// The browser going away usually means the session is ending; give
 		// that signal a moment to win so clients get the precise reason.
 		select {
 		case <-sessionDone:
 			closeWith(client, websocket.StatusGoingAway, "session terminated")
 			return "session terminated"
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(sessionEndGrace):
 		}
-		code, reason := closeInfo(err)
-		closeWith(client, code, reason)
-		return "browser closed: " + describe(err)
+		closeWith(client, websocket.StatusGoingAway, "browser disconnected")
+		return "browser closed: " + err.Error()
 	case <-ctx.Done():
 		closeWith(client, websocket.StatusGoingAway, "connection lost")
 		return "keepalive failed"
 	}
 }
 
-// pump copies whole messages from src to dst, streaming their payloads.
-func pump(ctx context.Context, dst, src *websocket.Conn) error {
-	bufp := copyBuffers.Get().(*[]byte)
-	defer copyBuffers.Put(bufp)
+// pumpToBrowser forwards client frames. CDP is JSON, so text and binary
+// frames are treated alike.
+func pumpToBrowser(ctx context.Context, browser runtime.CDPConn, client *websocket.Conn) error {
 	for {
-		typ, reader, err := src.Reader(ctx)
+		_, msg, err := client.Read(ctx)
 		if err != nil {
 			return err
 		}
-		writer, err := dst.Writer(ctx, typ)
+		if err := browser.Write(ctx, msg); err != nil {
+			return err
+		}
+	}
+}
+
+func pumpToClient(ctx context.Context, client *websocket.Conn, browser runtime.CDPConn) error {
+	for {
+		msg, err := browser.Read(ctx)
 		if err != nil {
 			return err
 		}
-		if _, err := io.CopyBuffer(writer, reader, *bufp); err != nil {
-			return err
-		}
-		if err := writer.Close(); err != nil {
+		if err := client.Write(ctx, websocket.MessageText, msg); err != nil {
 			return err
 		}
 	}
@@ -169,20 +167,6 @@ func keepalive(ctx context.Context, client *websocket.Conn, fail context.CancelF
 			}
 		}
 	}
-}
-
-// closeInfo maps a pump error to the close code to forward to the peer.
-func closeInfo(err error) (websocket.StatusCode, string) {
-	var ce websocket.CloseError
-	if errors.As(err, &ce) {
-		switch ce.Code {
-		case websocket.StatusNoStatusRcvd, websocket.StatusAbnormalClosure, websocket.StatusTLSHandshake:
-			// Reserved codes that must not be sent on the wire.
-			return websocket.StatusNormalClosure, ""
-		}
-		return ce.Code, ce.Reason
-	}
-	return websocket.StatusGoingAway, "peer disconnected"
 }
 
 func describe(err error) string {

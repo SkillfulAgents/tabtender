@@ -177,10 +177,12 @@ func (rf *rotatingFile) open() error {
 func (rf *rotatingFile) Write(p []byte) (int, error) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.size+int64(len(p)) > maxLogFileSize {
-		_ = rf.file.Close()
-		_ = os.Remove(rf.path + ".1")
-		_ = os.Rename(rf.path, rf.path+".1")
+	if rf.file != nil && rf.size+int64(len(p)) > maxLogFileSize {
+		rf.rotate()
+	}
+	if rf.file == nil {
+		// A previous attempt to open the file failed; keep trying, so
+		// logging resumes once the cause (a full disk, say) is gone.
 		if err := rf.open(); err != nil {
 			return 0, err
 		}
@@ -190,10 +192,26 @@ func (rf *rotatingFile) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// rotate moves the current file aside, replacing the previous generation.
+func (rf *rotatingFile) rotate() {
+	_ = rf.file.Close()
+	rf.file = nil
+	if err := os.Rename(rf.path, rf.path+".1"); err != nil {
+		// Keep appending to the oversized file and try again once it has
+		// grown by another full size, rather than on every write.
+		rf.size = 0
+	}
+}
+
 func (rf *rotatingFile) Close() error {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.file.Close()
+	if rf.file == nil {
+		return nil
+	}
+	err := rf.file.Close()
+	rf.file = nil
+	return err
 }
 
 // Setup builds the daemon logger. When logFile is non-empty, records are

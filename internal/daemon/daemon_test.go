@@ -145,11 +145,11 @@ func TestAdaptersAreReplaceable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := conn.Write(dialCtx, websocket.MessageBinary, []byte{1, 2, 3}); err != nil {
+	if err := conn.Write(dialCtx, websocket.MessageText, []byte(`{"id":1}`)); err != nil {
 		t.Fatal(err)
 	}
-	if typ, data, err := conn.Read(dialCtx); err != nil || typ != websocket.MessageBinary || len(data) != 3 {
-		t.Fatalf("echo through the proxy: %v %v %v", typ, data, err)
+	if _, data, err := conn.Read(dialCtx); err != nil || string(data) != `{"id":1}` {
+		t.Fatalf("echo through the proxy: %s %v", data, err)
 	}
 	_ = conn.CloseNow()
 

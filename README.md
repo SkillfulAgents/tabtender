@@ -16,7 +16,7 @@ authenticated HTTP/WebSocket endpoint.
   Windows: a native Windows Service.
 
 ```
-┌────────────┐  HTTPS / WSS   ┌─────────────────────────────┐  loopback CDP  ┌────────┐
+┌────────────┐  HTTPS / WSS   ┌─────────────────────────────┐  private pipe  ┌────────┐
 │ AI agent   │ ─────────────▶ │ tabtenderd                  │ ─────────────▶ │ Chrome │
 │ Playwright │  Bearer key    │ REST API · CDP proxy · TTLs │                ├────────┤
 │ Puppeteer  │ ◀───────────── │ sessions · tunnel · auth    │ ─────────────▶ │ Chrome │
@@ -30,39 +30,73 @@ authenticated HTTP/WebSocket endpoint.
 1. Download `Tabtender-<version>.dmg` from the
    [releases page](https://github.com/SkillfulAgents/tabtender/releases) and
    drag **Tabtender** to Applications. Google Chrome must be installed.
-2. Launch it. A menu-bar icon appears, and the app registers and starts the
-   `tabtenderd` background service (a per-user launchd agent — no root).
-3. Open **Settings → API Key** to copy your key.
+2. Beta builds are not notarized yet, so macOS refuses to open a downloaded
+   copy. Clear the download flag once, in Terminal:
+
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/Tabtender.app
+   ```
+
+3. Open Tabtender from Applications. A menu-bar icon appears, and the app
+   registers and starts the `tabtenderd` background service (a per-user
+   launchd agent — no root). macOS announces the new background item.
+4. Open **Settings → API Key** to copy your key.
+
+Open the app from the Applications folder, not from the disk image: the
+service is registered at the app's location, so the app declines to set it up
+from a place that will disappear.
 
 The service keeps running when you quit the menu-bar app, restarts after a
-crash, and starts at login (configurable).
+crash, and starts at login (configurable). The menu-bar app itself does not
+start at login; open it whenever you want to look at the service.
 
-To update, replace the app and open it once. macOS ties the background
+**Updating.** Replace the app and open it once. macOS ties the background
 service to the exact build that registered it, so the app registers the
 service again when it finds an older daemon running or launchd refusing to
 start the new one (this restarts the service and ends its sessions).
 
-> Release builds are currently ad-hoc signed, not notarized. On first launch,
-> right-click the app and choose **Open**, or build it yourself with your own
-> Developer ID (see [Building](#building)).
+**Uninstalling.** In the app, choose **Settings → General → Unregister**
+(this stops the service), quit the app, and move it to the Trash. Your data
+stays in `~/Library/Application Support/Tabtender` (configuration, named
+profiles, logs) and the API key in the login Keychain (item
+`com.skillfulagents.tabtender`); delete both to remove every trace.
+
+If the service does not start, look at
+`~/Library/Application Support/Tabtender/logs/`: `tabtenderd.log` is the
+service log, and `tabtenderd.crash.log` holds what it printed if it could not
+start at all (for example, a configuration file it cannot read or a port
+that is taken).
 
 ### Windows
 
 Download and extract `tabtender-<version>-windows-<arch>.zip`, then from an
-elevated PowerShell prompt:
+elevated Command Prompt or PowerShell window in that folder:
 
 ```powershell
-.\install.ps1
+.\install.cmd
 Get-Content "$env:ProgramData\Tabtender\secrets\initial-api-key.txt"   # one-time key retrieval
 ```
 
-This installs `tabtenderd` as a Windows Service that starts at boot. To supply
-your own key instead, use `.\install.ps1 -ApiKey <key>`. Remove everything with
-`.\uninstall.ps1 -PurgeData`.
+`install.cmd` runs `install.ps1` with the execution policy lifted for that one
+run; Windows otherwise refuses to run scripts from a downloaded zip. (If a
+Group Policy enforces the execution policy, unblock the two `.ps1` files with
+`Unblock-File` and run `.\install.ps1` directly.)
+
+This installs `tabtenderd` as a Windows Service that starts at boot and runs
+as its own unprivileged account, `NT SERVICE\tabtenderd`. Its data directory,
+`%ProgramData%\Tabtender`, is accessible only to that account, SYSTEM, and
+Administrators. To supply your own key instead, use
+`.\install.cmd -ApiKey <key>`.
+
+To upgrade, extract the new zip and run `.\install.cmd` again: the API key,
+configuration, and browser profiles are kept. `.\uninstall.cmd` removes the
+service and keeps the data; `.\uninstall.cmd -PurgeData` also deletes the data
+directory, including the API key and all profiles.
 
 A Windows Service runs in the non-interactive session 0, so sessions are
-**headless** there. Run `tabtenderd.exe` from a console in your own session for
-headed browsers.
+**headless** there. For headed browsers, stop the service and run
+`tabtenderd.exe` from a console in your own session, with
+`TABTENDER_DATA_DIR` pointing at a directory of your own.
 
 ### From source (any platform)
 
@@ -70,11 +104,12 @@ headed browsers.
 go run ./cmd/tabtenderd
 ```
 
-On macOS the generated key is in the Keychain; read it over the local
-management socket:
+The generated key is in the OS credential store; read it over the local
+management socket (macOS and Linux):
 
 ```sh
-curl --unix-socket ~/Library/Application\ Support/Tabtender/tabtenderd.sock http://tabtender/mgmt/v1/apikey
+curl --unix-socket ~/Library/Application\ Support/Tabtender/tabtenderd.sock http://tabtender/mgmt/v1/apikey   # macOS
+curl --unix-socket ~/.local/share/tabtender/tabtenderd.sock http://tabtender/mgmt/v1/apikey                   # Linux
 ```
 
 Or pin a key of your own (at least 32 characters): `TABTENDER_API_KEY=... go run ./cmd/tabtenderd`.
@@ -105,9 +140,10 @@ await fetch(`${api}/v1/sessions/${session.id}`, { method: 'DELETE', headers });
 Puppeteer: `puppeteer.connect({ browserWSEndpoint: session.cdpUrl })`.
 
 The `cdpUrl` ends in `?token=…`, a credential scoped to that one session. Hand
-it to a sandboxed agent or any CDP client that cannot set headers — it opens
+it to an agent or any CDP client that cannot set headers — at the API it opens
 that session's CDP endpoint and nothing else, so the API key never has to
-leave your orchestrator.
+leave your orchestrator. Mind what CDP itself allows, though: see
+[Security](#security).
 
 ## API
 
@@ -162,7 +198,8 @@ Errors look like `{"error": {"code": "validation_error", "message": "..."}}`:
   client disconnects. Clients may disconnect and reconnect freely; tabs,
   cookies, and storage stay as they were.
 - Ending a session shuts the browser down cleanly (falling back to a kill
-  after a grace period). As with any browser, state written in the last
+  after a grace period). Expiry follows the wall clock: a session whose TTL
+  ran out while the machine was asleep ends when it wakes. As with any browser, state written in the last
   instant before shutdown may not have reached the disk yet — give a named
   profile a moment after your final write before deleting its session.
 - Sessions without a `profile` use an ephemeral profile that is deleted when
@@ -173,13 +210,18 @@ Errors look like `{"error": {"code": "validation_error", "message": "..."}}`:
   temporary files are removed. `GET /v1/sessions/{id}` keeps reporting
   `status: "terminated"` with an `endReason` (`deleted`, `expired`, `crashed`,
   `shutdown`) for ten minutes.
-- Sessions do not survive a restart of the service. At startup, `tabtenderd`
+- Sessions do not survive a restart of the service, and browsers do not
+  outlive it: a browser exits when the service does, even if the service is
+  killed. At startup, `tabtenderd`
   reconciles: browsers left behind by a previous run are terminated — only
   after verifying, from their command line, that they belong to this
   installation — and ephemeral profiles are removed. Named profiles are kept.
-- The CDP proxy relays text and binary frames verbatim and never inspects
-  them. The browser's own CDP port listens on loopback only and is never
-  exposed.
+- Every CDP connection is independent: several clients can work in one
+  session at once, each as if it had connected to the browser by itself.
+- Browsers are driven through a private debugging pipe, never a debugging
+  port, so nothing on the machine can reach a session's browser except
+  through Tabtender's authenticated endpoint. `browser.extraArgs` that would
+  open a debugging port are rejected.
 
 ## Configuration
 
@@ -271,8 +313,8 @@ arrives.
 ## Security
 
 - A 256-bit API key is generated on first start and stored in the macOS
-  Keychain, or on Windows in a DPAPI-encrypted file readable only by SYSTEM
-  and Administrators. Keys are compared in constant time and never logged.
+  Keychain, or on Windows in a DPAPI-encrypted file readable only by the
+  service account, SYSTEM, and Administrators. Keys are compared in constant time and never logged.
 - Each session has its own random 256-bit token, embedded in its `cdpUrl`.
   It authorizes that session's CDP endpoint only — never the REST API, never
   another session — is kept in memory only, stays the same for the session's
@@ -282,8 +324,17 @@ arrives.
   browser until the session ends, and URLs are easier to leak than headers:
   reverse proxies, tunnels, and client libraries may log them. Tabtender
   never logs query strings. To revoke a leaked URL, delete the session.
-- The server binds to loopback by default. Chrome's CDP listeners are always
-  loopback-only and never exposed.
+- **A `cdpUrl` is as powerful as the browser it controls.** The token keeps
+  its holder out of the REST API and out of other sessions' endpoints, but
+  CDP is a debugging protocol: whoever drives a browser can make it read
+  local files (`file://`) and write files (downloads) with the permissions of
+  the user the service runs as — which is enough to reach that user's other
+  data, Tabtender's included. Sessions are native, unsandboxed browsers by
+  design. Hand a `cdpUrl` only to agents you would trust with that user
+  account; for agents you would not, run Tabtender under a dedicated OS
+  account or on a dedicated machine or VM.
+- The server binds to loopback by default. Browsers expose no debugging port
+  at all: Tabtender talks to each one over a private pipe.
 - The local management channel is a Unix socket with owner-only permissions;
   each connection's peer credentials must match the service's user.
 - Helper processes (Chrome, `cloudflared`) never inherit `TABTENDER_*`
@@ -296,8 +347,8 @@ arrives.
 
 Sessions give you separate processes and separate browsing state. They are
 **not a security boundary** between mutually untrusted users: everything runs
-as one OS user, and anyone holding the API key controls every session (a
-session token controls only its own).
+as one OS user, anyone holding the API key controls every session, and a
+session's browser can read whatever that user can.
 
 ## Architecture
 
@@ -307,7 +358,7 @@ internal/
   api/                 REST handlers, CDP WebSocket proxy, management API
   sessions/            session lifecycle, TTLs, limits, reconciliation
   runtime/             BrowserRuntime interface + registry
-    chrome/            Chrome adapter (discovery, launch flags, shutdown)
+    chrome/            Chrome adapter (discovery, launch, CDP over the debugging pipe)
     platform/          OS process handling (process groups, job objects)
   tunnel/              TunnelProvider interface, registry, supervisor
     cloudflare/        Quick and named tunnels via cloudflared
@@ -334,6 +385,12 @@ through a registry:
 type BrowserRuntime interface {
     Launch(ctx context.Context, opts BrowserOptions) (BrowserInstance, error)
     Close(ctx context.Context, instance BrowserInstance) error
+}
+
+type BrowserInstance interface {
+    Connect(ctx context.Context) (CDPConn, error) // one independent CDP connection
+    PID() int
+    IsRunning() bool
 }
 
 type TunnelProvider interface {
