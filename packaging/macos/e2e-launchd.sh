@@ -40,6 +40,18 @@ wait_until() { # description timeout-seconds command...
 daemon_up() { [ -n "$(daemon_pid)" ]; }
 daemon_down() { [ -z "$(daemon_pid)" ]; }
 
+# Replaces the daemon inside the app with a different build and re-signs the
+# bundle, as an app update does.
+install_daemon_build() { # version
+	local staged
+	staged="$(mktemp -d)/tabtenderd"
+	(cd "$ROOT" && go build -ldflags "-X github.com/SkillfulAgents/tabtender/internal/version.Version=$1" -o "$staged" ./cmd/tabtenderd)
+	cp "$staged" "$APP/Contents/MacOS/tabtenderd"
+	rm -rf "$(dirname "$staged")"
+	codesign --force --sign - --identifier com.skillfulagents.tabtender.daemon "$APP/Contents/MacOS/tabtenderd" 2>/dev/null
+	codesign --force --sign - "$APP" 2>/dev/null
+}
+
 cleanup() {
 	status=$?
 	pkill -f "$GUI\$" 2>/dev/null || true
@@ -137,10 +149,7 @@ step "Updating the app in place: the service moves to the new build"
 # macOS ties the registration to the build that made it and refuses to spawn
 # any other, so an update needs the app to register its service again.
 OLD_PID="$(daemon_pid)"
-(cd "$ROOT" && go build -ldflags "-X github.com/SkillfulAgents/tabtender/internal/version.Version=e2e-update" \
-	-o "$APP/Contents/MacOS/tabtenderd" ./cmd/tabtenderd)
-codesign --force --sign - --identifier com.skillfulagents.tabtender.daemon "$APP/Contents/MacOS/tabtenderd"
-codesign --force --sign - "$APP"
+install_daemon_build e2e-update
 [ "$(daemon_pid)" = "$OLD_PID" ] || fail "the old daemon should keep running until the app is opened"
 open -g "$APP"
 running_version() { mgmt GET /mgmt/v1/status 2>/dev/null | json 'd["version"]'; }
@@ -152,10 +161,7 @@ pkill -f "$GUI\$"
 # starting the service repairs it.
 "$GUI" --stop-service
 wait_until "the daemon to stop" 30 daemon_down
-(cd "$ROOT" && go build -ldflags "-X github.com/SkillfulAgents/tabtender/internal/version.Version=e2e-update-2" \
-	-o "$APP/Contents/MacOS/tabtenderd" ./cmd/tabtenderd)
-codesign --force --sign - --identifier com.skillfulagents.tabtender.daemon "$APP/Contents/MacOS/tabtenderd"
-codesign --force --sign - "$APP"
+install_daemon_build e2e-update-2
 "$GUI" --start-service
 wait_until "the daemon to start after the update" 30 daemon_up
 [ "$(running_version)" = e2e-update-2 ] || fail "expected the updated daemon, got $(running_version)"
