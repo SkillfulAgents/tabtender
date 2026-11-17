@@ -133,6 +133,33 @@ wait_until "the daemon to stop" 30 daemon_down
 launchctl kickstart "$TARGET"
 wait_until "the daemon to start at (simulated) login" 30 daemon_up
 
+step "Updating the app in place: the service moves to the new build"
+# macOS ties the registration to the build that made it and refuses to spawn
+# any other, so an update needs the app to register its service again.
+OLD_PID="$(daemon_pid)"
+(cd "$ROOT" && go build -ldflags "-X github.com/SkillfulAgents/tabtender/internal/version.Version=e2e-update" \
+	-o "$APP/Contents/MacOS/tabtenderd" ./cmd/tabtenderd)
+codesign --force --sign - --identifier com.skillfulagents.tabtender.daemon "$APP/Contents/MacOS/tabtenderd"
+codesign --force --sign - "$APP"
+[ "$(daemon_pid)" = "$OLD_PID" ] || fail "the old daemon should keep running until the app is opened"
+open -g "$APP"
+running_version() { mgmt GET /mgmt/v1/status 2>/dev/null | json 'd["version"]'; }
+wait_until "the updated daemon to take over" 60 sh -c '[ "$(curl -s --max-time 2 --unix-socket "'"$SOCKET"'" http://t/mgmt/v1/status | python3 -c "import json,sys; print(json.load(sys.stdin)[\"version\"])" 2>/dev/null)" = e2e-update ]'
+echo "now running version $(running_version) as pid $(daemon_pid)"
+pkill -f "$GUI\$"
+
+# The same after a stop: launchd cannot start the stale registration, and
+# starting the service repairs it.
+"$GUI" --stop-service
+wait_until "the daemon to stop" 30 daemon_down
+(cd "$ROOT" && go build -ldflags "-X github.com/SkillfulAgents/tabtender/internal/version.Version=e2e-update-2" \
+	-o "$APP/Contents/MacOS/tabtenderd" ./cmd/tabtenderd)
+codesign --force --sign - --identifier com.skillfulagents.tabtender.daemon "$APP/Contents/MacOS/tabtenderd"
+codesign --force --sign - "$APP"
+"$GUI" --start-service
+wait_until "the daemon to start after the update" 30 daemon_up
+[ "$(running_version)" = e2e-update-2 ] || fail "expected the updated daemon, got $(running_version)"
+
 step "Unregister"
 "$GUI" --unregister-service
 wait_until "the daemon to stop" 30 daemon_down

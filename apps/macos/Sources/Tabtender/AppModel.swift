@@ -42,6 +42,8 @@ final class AppModel: ObservableObject {
 
     private static let pollInterval: UInt64 = 2_000_000_000
     private static let firstLaunchKey = "didCompleteFirstLaunch"
+    private static let startFailureMessage =
+        "The service did not start. Try unregistering and registering it again in Settings."
 
     init(
         client: ManagementClient = ManagementClient(),
@@ -80,6 +82,7 @@ final class AppModel: ObservableObject {
         pollTask = Task {
             await refresh()
             await registerOnFirstLaunch()
+            await repairStaleRegistration()
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: Self.pollInterval)
                 await refresh()
@@ -92,6 +95,26 @@ final class AppModel: ObservableObject {
         defaults.set(true, forKey: Self.firstLaunchKey)
         if serviceState == .notRegistered {
             await registerService()
+        }
+    }
+
+    /// Registers the service again when the registration belongs to another
+    /// build of the app: launchd only spawns the daemon build it was
+    /// registered with, and a daemon that kept running across an update is
+    /// still the old one.
+    private func repairStaleRegistration() async {
+        guard registration == .enabled else { return }
+        let service = self.service
+        let runningVersion = status?.version
+        let isStale = await Task.detached {
+            if let runningVersion {
+                guard let bundled = service.bundledDaemonVersion else { return false }
+                return bundled != runningVersion
+            }
+            return service.isSpawnFailing
+        }.value
+        if isStale {
+            await reregisterService()
         }
     }
 
@@ -119,15 +142,34 @@ final class AppModel: ObservableObject {
     // MARK: Service control
 
     func registerService() async {
-        await changeService(expectRunning: true) { try $0.register() }
+        let client = self.client
+        await changeService(expectRunning: true) { service in
+            _ = try await service.registerVerified { (try? await client.status()) != nil }
+        }
+    }
+
+    /// Replaces a registration that launchd can no longer start.
+    func reregisterService() async {
+        let client = self.client
+        await changeService(expectRunning: true) { service in
+            _ = try await service.repairRegistration { (try? await client.status()) != nil }
+        }
     }
 
     func unregisterService() async {
         await changeService(expectRunning: false) { try $0.unregister() }
     }
 
+    /// Starts the service. If launchd accepts the request but the daemon
+    /// never comes up, the registration is stale; it is replaced once, and
+    /// a failure after that is reported instead of leaving the user guessing.
     func startService() async {
         await changeService(expectRunning: true) { try $0.start() }
+        guard status == nil, actionError == nil, registration == .enabled else { return }
+        await reregisterService()
+        if status == nil, actionError == nil {
+            actionError = Self.startFailureMessage
+        }
     }
 
     func stopService() async {

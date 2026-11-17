@@ -11,6 +11,9 @@ enum ServiceCommand: String {
 
     /// How long to wait for the daemon to come up or go away.
     private static let settleTimeout: TimeInterval = 20
+    /// How long a kickstarted daemon gets before its registration is
+    /// considered stale.
+    private static let startTimeout: TimeInterval = 8
 
     init?(arguments: [String]) {
         guard let command = arguments.dropFirst().lazy.compactMap(ServiceCommand.init(rawValue:)).first else {
@@ -51,12 +54,16 @@ enum ServiceCommand: String {
             return 0
         }
         do {
-            try service.register()
+            _ = try await service.registerVerified { (try? await client.status()) != nil }
         } catch where service.registrationStatus == .requiresApproval {
             print("service registered, but it must be allowed in System Settings > General > Login Items")
             return 2
         }
-        return await reportStarted(client, prefix: "service registered")
+        if service.registrationStatus == .requiresApproval {
+            print("service registered, but it must be allowed in System Settings > General > Login Items")
+            return 2
+        }
+        return await reportStarted(client, prefix: "service registered", timeout: 2)
     }
 
     private func unregister(_ service: ServiceController) throws -> Int32 {
@@ -75,7 +82,14 @@ enum ServiceCommand: String {
             return 0
         }
         try service.start()
-        return await reportStarted(client, prefix: "service started")
+        if await reportStarted(client, prefix: "service started", timeout: Self.startTimeout) == 0 {
+            return 0
+        }
+        // launchd only spawns the build the service was registered with;
+        // a registration left over from another build has to be replaced.
+        print("replacing a stale service registration")
+        _ = try await service.repairRegistration { (try? await client.status()) != nil }
+        return await reportStarted(client, prefix: "service registered again", timeout: 2)
     }
 
     private func stop(_ service: ServiceController, _ client: ManagementClient) async throws -> Int32 {
@@ -92,8 +106,12 @@ enum ServiceCommand: String {
         return 0
     }
 
-    private func reportStarted(_ client: ManagementClient, prefix: String) async -> Int32 {
-        let deadline = Date().addingTimeInterval(Self.settleTimeout)
+    private func reportStarted(
+        _ client: ManagementClient,
+        prefix: String,
+        timeout: TimeInterval = ServiceCommand.settleTimeout
+    ) async -> Int32 {
+        let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if let daemon = try? await client.status() {
                 print("\(prefix); daemon running (pid \(daemon.pid))")

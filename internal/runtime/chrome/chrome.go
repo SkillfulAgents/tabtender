@@ -122,7 +122,11 @@ func (r *Runtime) Launch(ctx context.Context, opts runtime.BrowserOptions) (runt
 	}
 
 	stderr := &tailBuffer{max: stderrTailSize}
-	cmd := exec.Command(executable, launchArgs(opts, r.cfg.ExtraArgs)...)
+	argv := append([]string{executable}, launchArgs(opts, r.cfg.ExtraArgs)...)
+	if len(r.cfg.Launcher) > 0 {
+		argv = append(append([]string{}, r.cfg.Launcher...), argv...)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stderr = stderr
 	cmd.Env = platform.ChildEnv()
 	platform.Prepare(cmd)

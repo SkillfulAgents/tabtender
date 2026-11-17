@@ -26,6 +26,11 @@ type RuntimeConfig struct {
 	ExecutablePath string
 	// ExtraArgs are appended to the adapter's own launch flags.
 	ExtraArgs []string
+	// Launcher, when set, is a command prefix that starts the browser: the
+	// adapter runs Launcher followed by the browser executable and its
+	// arguments. The launcher must replace itself with the browser (exec),
+	// keeping the process ID.
+	Launcher []string
 	// Logger receives adapter diagnostics; nil discards them.
 	Logger *slog.Logger
 }

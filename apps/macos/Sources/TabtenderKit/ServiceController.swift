@@ -76,6 +76,101 @@ public struct ServiceController: Sendable {
         try registration.register()
     }
 
+    /// Replaces the registration with a fresh one, restarting the daemon.
+    ///
+    /// macOS ties a registered launch agent to the exact build of the app
+    /// that registered it. After the app is updated, launchd refuses to spawn
+    /// the new daemon ("spawn failed", exit 78) until it is registered again.
+    public func reregister(settleDelay: TimeInterval = 1) async throws {
+        // The old registration may already be gone; only the new one matters.
+        try? registration.unregister()
+        try? await Task.sleep(nanoseconds: UInt64(settleDelay * 1_000_000_000))
+        try register()
+    }
+
+    /// Registers the service and makes sure the daemon actually comes up,
+    /// returning whether it did.
+    ///
+    /// macOS can reject the first spawn of a build it has not seen at this
+    /// location before; registering again resolves it.
+    ///
+    /// - Parameters:
+    ///   - isRunning: Reports whether the daemon is answering.
+    ///   - startTimeout: How long each attempt waits for the daemon.
+    public func registerVerified(
+        startTimeout: TimeInterval = 6,
+        settleDelay: TimeInterval = 1,
+        isRunning: @Sendable () async -> Bool
+    ) async throws -> Bool {
+        try register()
+        if await waitUntilRunning(isRunning, timeout: startTimeout) {
+            return true
+        }
+        guard registrationStatus == .enabled else {
+            // Waiting for the user's approval; registering again cannot help.
+            return false
+        }
+        return try await repairRegistration(
+            startTimeout: startTimeout, settleDelay: settleDelay, isRunning: isRunning)
+    }
+
+    /// Re-registers the service until the daemon comes up, and returns
+    /// whether it did.
+    ///
+    /// One re-registration is not always enough: right after the app has
+    /// been replaced, macOS still rejects the first spawn of the new build
+    /// and only accepts a registration made after that.
+    public func repairRegistration(
+        attempts: Int = 3,
+        startTimeout: TimeInterval = 6,
+        settleDelay: TimeInterval = 1,
+        isRunning: @Sendable () async -> Bool
+    ) async throws -> Bool {
+        for _ in 0..<attempts {
+            try await reregister(settleDelay: settleDelay)
+            if await waitUntilRunning(isRunning, timeout: startTimeout) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func waitUntilRunning(_ isRunning: @Sendable () async -> Bool, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            if await isRunning() {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        } while Date() < deadline
+        return false
+    }
+
+    /// Whether launchd is failing to spawn the registered daemon, as it does
+    /// when the registration belongs to another build of the app.
+    public var isSpawnFailing: Bool {
+        guard let result = try? runner.run(Self.launchctlURL, arguments: ["print", serviceTarget]),
+              result.exitCode == 0
+        else {
+            return false
+        }
+        return result.output.contains("job state = spawn failed")
+            || result.output.contains("OS_REASON_CODESIGNING")
+    }
+
+    /// The version of the daemon bundled with the app, or `nil` if it cannot
+    /// be determined.
+    public var bundledDaemonVersion: String? {
+        guard let daemonURL,
+              let result = try? runner.run(daemonURL, arguments: ["version"]),
+              result.exitCode == 0
+        else {
+            return nil
+        }
+        let version = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return version.isEmpty ? nil : version
+    }
+
     /// Unregisters the launch agent, which also stops the daemon.
     public func unregister() throws {
         try registration.unregister()

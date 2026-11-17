@@ -37,6 +37,11 @@ authenticated HTTP/WebSocket endpoint.
 The service keeps running when you quit the menu-bar app, restarts after a
 crash, and starts at login (configurable).
 
+To update, replace the app and open it once. macOS ties the background
+service to the exact build that registered it, so the app registers the
+service again when it finds an older daemon running or launchd refusing to
+start the new one (this restarts the service and ends its sessions).
+
 > Release builds are currently ad-hoc signed, not notarized. On first launch,
 > right-click the app and choose **Open**, or build it yourself with your own
 > Developer ID (see [Building](#building)).
@@ -266,6 +271,9 @@ every request regardless of how it arrives.
   each connection's peer credentials must match the service's user.
 - Helper processes (Chrome, `cloudflared`) never inherit `TABTENDER_*`
   variables.
+- On macOS, browsers are started as their own "responsible process", so the
+  system attributes what Chrome does (such as updating itself) to Chrome,
+  not to Tabtender.
 - For mTLS, terminate it at a reverse proxy or the tunnel ingress and set
   `server.publicUrl`.
 

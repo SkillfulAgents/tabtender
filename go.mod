@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/coder/websocket v1.8.15
+	github.com/ebitengine/purego v0.11.2
 	github.com/gofrs/flock v0.13.2
 	github.com/shirou/gopsutil/v4 v4.26.10
 	github.com/zalando/go-keyring v0.2.8
@@ -13,7 +14,6 @@ require (
 
 require (
 	github.com/danieljoos/wincred v1.2.3 // indirect
-	github.com/ebitengine/purego v0.11.2 // indirect
 	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect

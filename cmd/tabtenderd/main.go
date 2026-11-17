@@ -16,6 +16,7 @@ import (
 
 	"github.com/SkillfulAgents/tabtender/internal/config"
 	"github.com/SkillfulAgents/tabtender/internal/daemon"
+	"github.com/SkillfulAgents/tabtender/internal/runtime/platform"
 	"github.com/SkillfulAgents/tabtender/internal/service"
 	"github.com/SkillfulAgents/tabtender/internal/version"
 )
@@ -40,6 +41,12 @@ func dispatch(args []string) error {
 		return nil
 	case "service":
 		return serviceCommand(args)
+	case daemon.DisclaimExecCommand:
+		// Internal: used by the daemon itself to start browsers on macOS.
+		if len(args) == 0 {
+			return fmt.Errorf("usage: tabtenderd %s <program> [arguments...]", daemon.DisclaimExecCommand)
+		}
+		return platform.DisclaimExec(args[0], args, os.Environ())
 	default:
 		return fmt.Errorf("unknown command %q (expected run, version, or service)", command)
 	}

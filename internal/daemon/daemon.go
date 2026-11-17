@@ -330,8 +330,27 @@ func (d *Daemon) newRuntime(cfg config.Config) (runtime.BrowserRuntime, error) {
 	return d.runtimes.Create(cfg.Browser.Runtime, runtime.RuntimeConfig{
 		ExecutablePath: cfg.Browser.ExecutablePath,
 		ExtraArgs:      cfg.Browser.ExtraArgs,
+		Launcher:       browserLauncher(),
 		Logger:         d.logger,
 	})
+}
+
+// DisclaimExecCommand is the hidden tabtenderd subcommand that starts a
+// program as its own responsible process (see platform.DisclaimExec).
+const DisclaimExecCommand = "disclaim-exec"
+
+// browserLauncher returns the command prefix used to start browsers. On
+// macOS browsers are started through tabtenderd's own disclaim-exec command
+// so that they, not Tabtender, answer for what they do.
+func browserLauncher() []string {
+	if !platform.DisclaimSupported {
+		return nil
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return nil
+	}
+	return []string{self, DisclaimExecCommand}
 }
 
 func (d *Daemon) tunnelToken() (token, source string) {
