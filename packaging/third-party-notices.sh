@@ -9,6 +9,14 @@ out="${1:?usage: third-party-notices.sh <output file>}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
+# Modules of the other release platforms are not in the cache yet on a
+# machine that only built for itself. Fetching them can hit a flaky network.
+for attempt in 1 2 3; do
+  go mod download && break
+  [ "$attempt" = 3 ] && { echo "could not download the Go modules" >&2; exit 1; }
+  sleep 5
+done
+
 {
   echo "Tabtender includes the following third-party software."
   echo
