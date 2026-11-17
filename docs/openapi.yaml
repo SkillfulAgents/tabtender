@@ -1,0 +1,355 @@
+openapi: 3.1.0
+info:
+  title: Tabtender API
+  summary: Native browser sessions for AI agents over the Chrome DevTools Protocol.
+  description: |
+    The public, network-facing API of `tabtenderd`. Every request, including
+    the CDP WebSocket handshake, must carry `Authorization: Bearer <api key>`.
+
+    The local management API (served on a Unix domain socket) is documented in
+    [api.md](api.md).
+  version: 1.0.0
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://127.0.0.1:3000
+    description: Default local address
+security:
+  - apiKey: []
+tags:
+  - name: Sessions
+  - name: Service
+paths:
+  /v1/sessions:
+    post:
+      tags: [Sessions]
+      operationId: createSession
+      summary: Create a browser session
+      description: Launches a browser and returns once its CDP endpoint is ready.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSessionRequest"
+            example:
+              ttlSeconds: 1800
+              headless: false
+              profile: work
+      responses:
+        "201":
+          description: The session is running.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: The named profile is in use by another session (`profile_in_use`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: The concurrent session limit is reached (`capacity_exceeded`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: The browser could not be started (`browser_launch_failed`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: The service is stopping (`shutting_down`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    get:
+      tags: [Sessions]
+      operationId: listSessions
+      summary: List active sessions
+      description: Returns sessions that have not ended, oldest first.
+      responses:
+        "200":
+          description: Active sessions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions]
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Session"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/sessions/{id}:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      tags: [Sessions]
+      operationId: getSession
+      summary: Get session status
+      description: |
+        Also returns sessions that ended within the last ten minutes, with
+        `status: terminated` and an `endReason`.
+      responses:
+        "200":
+          description: The session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/SessionNotFound"
+    delete:
+      tags: [Sessions]
+      operationId: deleteSession
+      summary: Terminate a session
+      description: |
+        Shuts the browser down, closes its CDP connections, and removes an
+        ephemeral profile. Returns once cleanup is complete.
+      responses:
+        "200":
+          description: The terminated session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/SessionNotFound"
+  /v1/sessions/{id}/cdp:
+    parameters:
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      tags: [Sessions]
+      operationId: connectCDP
+      summary: CDP WebSocket
+      description: |
+        Upgrades to a WebSocket connected to the session's browser-level CDP
+        endpoint. Text and binary messages are relayed verbatim in both
+        directions. Disconnecting does not end the session, and clients may
+        reconnect while it is running. When the session ends, clients are
+        closed with status 1001 and reason `session terminated`.
+      responses:
+        "101":
+          description: Switching protocols; the connection is now a CDP WebSocket.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/SessionNotFound"
+        "409":
+          description: The session has ended or is not running yet (`session_not_running`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "426":
+          description: The request was not a WebSocket upgrade (`upgrade_required`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: The session's browser did not accept the connection (`browser_unreachable`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /v1/health:
+    get:
+      tags: [Service]
+      operationId: getHealth
+      summary: Health, capacity, and tunnel status
+      responses:
+        "200":
+          description: Service health.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: The Tabtender API key.
+  parameters:
+    SessionId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^sess_[a-z2-7]{26}$"
+      example: sess_ru5g7woaasehntbed6f5ygzgqi
+  responses:
+    Unauthorized:
+      description: Missing or wrong API key (`unauthorized`).
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+          example: Bearer realm="tabtender"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ValidationError:
+      description: Malformed body, unknown field, or a value outside its limits (`validation_error`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: validation_error
+              message: ttlSeconds 99999 exceeds the maximum session TTL of 14400 seconds
+    SessionNotFound:
+      description: Unknown session (`session_not_found`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    CreateSessionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        ttlSeconds:
+          type: integer
+          minimum: 1
+          description: Session lifetime in seconds. Defaults to `sessions.defaultTTL`; may not exceed `sessions.maxTTL`.
+        headless:
+          type: boolean
+          description: Run without a window. Defaults to `browser.headless`. `false` is rejected where no desktop exists.
+        profile:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+          description: Named persistent profile. Omit for an ephemeral profile that is deleted with the session.
+    Session:
+      type: object
+      required: [id, status, headless, createdAt, expiresAt, connectedClients]
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+          enum: [starting, running, terminating, terminated]
+        headless:
+          type: boolean
+        profile:
+          type: string
+          description: Present only for sessions on a named profile.
+        createdAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+          description: When the TTL ends. The TTL starts once the browser is ready.
+        cdpUrl:
+          type: string
+          format: uri
+          description: WebSocket URL of the session's CDP endpoint. Absent once terminated.
+        connectedClients:
+          type: integer
+          minimum: 0
+        endedAt:
+          type: string
+          format: date-time
+          description: Present only when terminated.
+        endReason:
+          type: string
+          enum: [deleted, expired, crashed, shutdown]
+          description: Present only when terminated.
+      example:
+        id: sess_ru5g7woaasehntbed6f5ygzgqi
+        status: running
+        headless: true
+        profile: work
+        createdAt: "2026-11-17T00:54:16.66132Z"
+        expiresAt: "2026-11-17T01:54:17.066109Z"
+        cdpUrl: ws://127.0.0.1:3000/v1/sessions/sess_ru5g7woaasehntbed6f5ygzgqi/cdp
+        connectedClients: 0
+    Health:
+      type: object
+      required: [status, version, uptimeSeconds, sessions, browser, tunnel]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+          description: "`degraded` when the configured browser cannot be found."
+        version:
+          type: string
+        uptimeSeconds:
+          type: integer
+        sessions:
+          type: object
+          required: [active, max, available]
+          properties:
+            active:
+              type: integer
+            max:
+              type: integer
+            available:
+              type: integer
+        browser:
+          type: object
+          required: [runtime, available]
+          properties:
+            runtime:
+              type: string
+            available:
+              type: boolean
+            error:
+              type: string
+              description: Why the browser is unavailable.
+        tunnel:
+          $ref: "#/components/schemas/TunnelStatus"
+    TunnelStatus:
+      type: object
+      required: [provider, state, url, error]
+      properties:
+        provider:
+          type: string
+          description: The configured tunnel provider; `none` for local-only access.
+          examples: [none, cloudflare-quick, cloudflare-named]
+        state:
+          type: string
+          enum: [disabled, starting, running, error, stopped]
+        url:
+          type: string
+          description: Public base URL while running, otherwise empty.
+        error:
+          type: string
+          description: Last error, otherwise empty.
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable, machine-readable error code.
+            message:
+              type: string
+              description: Human-readable explanation.

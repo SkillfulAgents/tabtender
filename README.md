@@ -101,7 +101,9 @@ Puppeteer: `puppeteer.connect({ browserWSEndpoint: session.cdpUrl, headers })`.
 ## API
 
 Every request — including the CDP WebSocket handshake — must carry
-`Authorization: Bearer <api key>`.
+`Authorization: Bearer <api key>`. This is a summary; the full reference,
+including the local management API, is in [docs/api.md](docs/api.md), and the
+public API is also described in [docs/openapi.yaml](docs/openapi.yaml).
 
 | Method   | Endpoint                 | Purpose                                 |
 | -------- | ------------------------ | --------------------------------------- |
@@ -289,6 +291,7 @@ internal/
   daemon/              wiring
 apps/macos/            SwiftUI menu-bar app (management client only)
 packaging/             macOS .app/DMG, Windows service installer
+docs/                  API reference and OpenAPI description
 test/e2e/              end-to-end tests: real tabtenderd + real Chrome
 test/clients/          Playwright and Puppeteer conformance suite
 ```

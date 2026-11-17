@@ -676,6 +676,12 @@ func TestManagementStatusProfilesLogsAndTunnel(t *testing.T) {
 	if resp := h.manage(http.MethodDelete, "/mgmt/v1/profiles/alpha", ""); resp.status != http.StatusNoContent {
 		t.Fatalf("delete profile: %d %s", resp.status, resp.raw)
 	}
+	if resp := h.manage(http.MethodDelete, "/mgmt/v1/profiles/alpha", ""); resp.status != http.StatusNotFound || resp.errorCode(t) != "profile_not_found" {
+		t.Fatalf("delete missing profile: %d %s", resp.status, resp.raw)
+	}
+	if resp := h.manage(http.MethodDelete, "/mgmt/v1/profiles/bad.name", ""); resp.status != http.StatusBadRequest {
+		t.Fatalf("delete profile with an invalid name: %d", resp.status)
+	}
 
 	h.server.Logger.Warn("something odd", "detail", "x")
 	var logs struct{ Entries []logging.Entry }

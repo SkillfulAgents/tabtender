@@ -194,11 +194,14 @@ func (s *Server) handleListProfiles(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
 	if err := s.Sessions.DeleteProfile(r.PathValue("name")); err != nil {
 		var se *sessions.Error
-		if errors.As(err, &se) {
+		switch {
+		case errors.As(err, &se) && se.Kind == sessions.KindNotFound:
+			writeError(w, http.StatusNotFound, "profile_not_found", se.Message)
+		case errors.As(err, &se):
 			s.writeSessionError(w, err)
-			return
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		}
-		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
