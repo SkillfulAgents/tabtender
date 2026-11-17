@@ -20,6 +20,17 @@ struct MenuBarView: View {
             }
             ActionErrorBanner(kind: .service)
             ActionErrorBanner(kind: .session)
+            // Shown where a sleeping Mac costs the most: when other machines
+            // are meant to reach the service.
+            if !model.sleepRisks.isEmpty, model.config?.effective.servesOtherMachines == true {
+                Banner(
+                    message: "This Mac's settings let it go offline while idle.",
+                    systemImage: "moon.zzz.fill",
+                    tint: .orange
+                ) {
+                    SettingsButton(title: "Review…")
+                }
+            }
             if let explanation = model.serviceState.explanation {
                 Text(explanation)
                     .font(.callout)
@@ -150,11 +161,13 @@ private struct URLValue: View {
 /// activated automatically, so the window would otherwise open in the
 /// background.
 private struct SettingsButton: View {
+    var title = "Settings…"
+
     var body: some View {
         if #available(macOS 14, *) {
-            ModernSettingsButton()
+            ModernSettingsButton(title: title)
         } else {
-            Button("Settings…") {
+            Button(title) {
                 NSApp.activate(ignoringOtherApps: true)
                 NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
             }
@@ -165,9 +178,10 @@ private struct SettingsButton: View {
 @available(macOS 14, *)
 private struct ModernSettingsButton: View {
     @Environment(\.openSettings) private var openSettings
+    let title: String
 
     var body: some View {
-        Button("Settings…") {
+        Button(title) {
             NSApp.activate(ignoringOtherApps: true)
             openSettings()
         }

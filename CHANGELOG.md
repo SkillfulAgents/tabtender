@@ -27,6 +27,8 @@ The first version intended for use outside development.
   account, with in-place upgrades.
 - Keeps the machine awake while sessions are active, or optionally for as
   long as the service runs (`app.keepAwake`), so it stays reachable.
+- macOS: the app points out system settings that will put the Mac to sleep
+  or log the user out while idle, and opens them in System Settings.
 - Optional Cloudflare quick and named tunnels, supervised with backoff.
 - Configuration through file, environment, and a local management API, with
   live reload.

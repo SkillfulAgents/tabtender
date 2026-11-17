@@ -27,6 +27,9 @@ final class AppModel: ObservableObject {
     /// action of that kind or until dismissed.
     @Published private(set) var actionErrors: [ActionKind: String] = [:]
 
+    /// This Mac's sleep and logout settings; `nil` until read.
+    @Published private(set) var powerSettings: PowerSettings?
+
     // MARK: Configuration editing
 
     @Published private(set) var config: ConfigSnapshot?
@@ -38,12 +41,16 @@ final class AppModel: ObservableObject {
     let client: ManagementClient
     private let service: ServiceController
     private let defaults: UserDefaults
+    private let powerSettingsReader = PowerSettingsReader()
     private var pollTask: Task<Void, Never>?
     /// Known even when the rest of the daemon's status cannot be decoded.
     private var identity: DaemonIdentity?
     private var refreshGeneration = 0
 
     private static let pollInterval: UInt64 = 2_000_000_000
+    /// System settings change rarely; they are re-read every this many polls
+    /// and whenever the user comes back to the app.
+    private static let pollsPerPowerSettingsRefresh = 30
     private static let firstLaunchKey = "didCompleteFirstLaunch"
     private static let startFailureMessage =
         "The service did not start. Try unregistering and registering it again in Settings."
@@ -78,7 +85,12 @@ final class AppModel: ObservableObject {
             await refresh()
             await registerOnFirstLaunch()
             await repairStaleRegistration()
+            var polls = 0
             while !Task.isCancelled {
+                if polls % Self.pollsPerPowerSettingsRefresh == 0 {
+                    await refreshPowerSettings()
+                }
+                polls += 1
                 try? await Task.sleep(nanoseconds: Self.pollInterval)
                 await refresh()
             }
@@ -160,6 +172,20 @@ final class AppModel: ObservableObject {
         if details != nil, !wasRunning || config == nil {
             await reloadConfig()
         }
+    }
+
+    // MARK: Staying awake
+
+    /// The macOS settings that will take the service offline, given how the
+    /// running service prevents sleep.
+    var sleepRisks: [SleepRisk] {
+        guard let powerSettings, let app = config?.effective.app, status != nil else { return [] }
+        return SleepRisk.risks(settings: powerSettings, prevention: app.sleepPrevention)
+    }
+
+    func refreshPowerSettings() async {
+        let reader = powerSettingsReader
+        powerSettings = await Task.detached { reader.read() }.value
     }
 
     // MARK: Service control

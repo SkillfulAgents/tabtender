@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import TabtenderKit
 
@@ -44,6 +45,7 @@ struct GeneralSettingsView: View {
                             : nil
                     )
                 }
+                SleepRiskList()
             }
             Section("Server") {
                 SettingRow(title: "Host", key: "server.host", snapshot: snapshot) { label in
@@ -54,5 +56,40 @@ struct GeneralSettingsView: View {
                 }
             }
         }
+    }
+}
+
+/// The macOS settings that will take the service offline, each with a way
+/// to the setting that removes it.
+private struct SleepRiskList: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        let hasBattery = model.powerSettings?.hasBattery ?? false
+        let prevention = model.config?.effective.app.sleepPrevention ?? .never
+        ForEach(model.sleepRisks) { risk in
+            let pane = risk.settingsPane(
+                hasBattery: hasBattery,
+                macOSMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+            )
+            VStack(alignment: .leading, spacing: 6) {
+                Label(risk.summary(prevention: prevention), systemImage: "moon.zzz.fill")
+                    .foregroundStyle(.orange)
+                Text(risk.remedy(hasBattery: hasBattery))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                if let pane {
+                    Button(pane.buttonTitle) {
+                        NSWorkspace.shared.open(pane.url)
+                    }
+                }
+            }
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        // The user may have just changed a setting in System Settings.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await model.refreshPowerSettings() }
+        }
+        .task { await model.refreshPowerSettings() }
     }
 }

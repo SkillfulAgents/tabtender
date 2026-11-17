@@ -56,6 +56,11 @@ too, set **Settings → General → Keep this Mac awake** to **Always**
 (`app.keepAwake`). The display can still sleep, and a laptop still sleeps
 when its lid is closed.
 
+The same place lists the macOS settings that would still take the service
+offline — the Mac's own sleep timers while "Always" is off, and automatic
+logout after inactivity — each with a button that opens the setting in
+System Settings.
+
 **Updating.** Replace the app and open it once. macOS ties the background
 service to the exact build that registered it, so the app registers the
 service again when it finds an older daemon running or launchd refusing to
