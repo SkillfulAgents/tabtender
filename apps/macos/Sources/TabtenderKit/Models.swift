@@ -193,7 +193,41 @@ public struct Configuration: Codable, Equatable, Sendable {
 
     public struct App: Codable, Equatable, Sendable {
         public var startOnLogin: Bool
+        /// Keep the machine awake while sessions are active.
         public var preventSleep: Bool
+        /// Keep the machine awake for as long as the service runs.
+        public var keepAwake: Bool
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            startOnLogin = try container.decode(Bool.self, forKey: .startOnLogin)
+            preventSleep = try container.decode(Bool.self, forKey: .preventSleep)
+            // A daemon from before the setting existed does not report it.
+            keepAwake = try container.decodeIfPresent(Bool.self, forKey: .keepAwake) ?? false
+        }
+
+        /// The two settings as the single choice the user makes.
+        public var sleepPrevention: SleepPrevention {
+            get {
+                if keepAwake { return .always }
+                return preventSleep ? .whileSessionsAreActive : .never
+            }
+            set {
+                keepAwake = newValue == .always
+                // Kept on under `always`, so turning that off by hand in the
+                // file falls back to the default rather than to nothing.
+                preventSleep = newValue != .never
+            }
+        }
+    }
+
+    /// When the service keeps the machine from going to sleep.
+    public enum SleepPrevention: String, CaseIterable, Identifiable, Sendable {
+        case never
+        case whileSessionsAreActive
+        case always
+
+        public var id: String { rawValue }
     }
 
     /// Asks the daemon to discover an executable on its own.

@@ -31,7 +31,19 @@ struct GeneralSettingsView: View {
         } content: { $config, snapshot in
             Section {
                 Toggle("Start at login", isOn: $config.app.startOnLogin)
-                Toggle("Prevent sleep while sessions are active", isOn: $config.app.preventSleep)
+                Picker(selection: $config.app.sleepPrevention) {
+                    Text("Never").tag(Configuration.SleepPrevention.never)
+                    Text("While sessions are active").tag(Configuration.SleepPrevention.whileSessionsAreActive)
+                    Text("Always").tag(Configuration.SleepPrevention.always)
+                } label: {
+                    SettingLabel(
+                        title: "Keep this Mac awake",
+                        caption: config.app.sleepPrevention == .always
+                            ? "Awake whenever the service runs, so it stays reachable. "
+                                + "The display can still sleep; a closed laptop lid still sleeps the Mac."
+                            : nil
+                    )
+                }
             }
             Section("Server") {
                 SettingRow(title: "Host", key: "server.host", snapshot: snapshot) { label in

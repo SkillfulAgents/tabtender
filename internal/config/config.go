@@ -81,7 +81,11 @@ type Cloudflare struct {
 // App holds settings for OS integration.
 type App struct {
 	StartOnLogin bool `yaml:"startOnLogin" json:"startOnLogin"`
+	// PreventSleep keeps the machine awake while sessions are active.
 	PreventSleep bool `yaml:"preventSleep" json:"preventSleep"`
+	// KeepAwake keeps the machine awake for as long as the service runs, so
+	// that it stays reachable between sessions.
+	KeepAwake bool `yaml:"keepAwake" json:"keepAwake"`
 }
 
 // Default returns the built-in defaults.

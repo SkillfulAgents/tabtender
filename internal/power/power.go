@@ -1,25 +1,38 @@
-// Package power keeps the machine awake while browser sessions are active.
+// Package power keeps the machine awake while the service needs it.
 package power
 
 import "sync"
 
-// Inhibitor prevents idle system sleep while held.
+// Policy says when idle system sleep is prevented.
+type Policy struct {
+	// WhileActive prevents sleep while browser sessions are active.
+	WhileActive bool
+	// Always prevents sleep for as long as the service runs.
+	Always bool
+}
+
+// Inhibitor prevents idle system sleep while its policy calls for it.
 type Inhibitor struct {
 	mu      sync.Mutex
-	enabled bool
-	wanted  bool
+	policy  Policy
+	active  bool
+	closed  bool
 	held    bool
 	release func()
 }
 
-// NewInhibitor returns an inhibitor; enabled mirrors app.preventSleep.
-func NewInhibitor(enabled bool) *Inhibitor { return &Inhibitor{enabled: enabled} }
+// NewInhibitor returns an inhibitor that follows policy from the start.
+func NewInhibitor(policy Policy) *Inhibitor {
+	i := &Inhibitor{}
+	i.SetPolicy(policy)
+	return i
+}
 
-// SetEnabled turns the feature on or off, applying the change immediately.
-func (i *Inhibitor) SetEnabled(enabled bool) {
+// SetPolicy changes the policy, applying it immediately.
+func (i *Inhibitor) SetPolicy(policy Policy) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	i.enabled = enabled
+	i.policy = policy
 	i.syncLocked()
 }
 
@@ -27,7 +40,7 @@ func (i *Inhibitor) SetEnabled(enabled bool) {
 func (i *Inhibitor) SetActive(active bool) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	i.wanted = active
+	i.active = active
 	i.syncLocked()
 }
 
@@ -38,16 +51,16 @@ func (i *Inhibitor) Held() bool {
 	return i.held
 }
 
-// Close releases the inhibition.
+// Close releases the inhibition for good.
 func (i *Inhibitor) Close() {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	i.wanted = false
+	i.closed = true
 	i.syncLocked()
 }
 
 func (i *Inhibitor) syncLocked() {
-	want := i.enabled && i.wanted
+	want := !i.closed && (i.policy.Always || i.policy.WhileActive && i.active)
 	switch {
 	case want && !i.held:
 		if release, err := acquire(); err == nil {

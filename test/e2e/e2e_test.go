@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -682,6 +683,44 @@ func TestManagementConfigAppliesLiveAndPersists(t *testing.T) {
 	if !strings.Contains(string(saved), fmt.Sprintf("port: %d", otherPort)) {
 		t.Fatalf("file-layer port not saved:\n%s", saved)
 	}
+}
+
+// With app.keepAwake the service holds off system sleep for as long as it
+// runs, with or without sessions, and stops doing so when it exits.
+func TestKeepAwakeHoldsWhileTheServiceRuns(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("observed through caffeinate, which is macOS only")
+	}
+	spec := newSpec(t)
+	d := spec.start(t)
+	// The daemon keeps the machine awake through a caffeinate bound to it.
+	holder := fmt.Sprintf("caffeinate -i -w %d", d.cmd.Process.Pid)
+	held := func() bool { return exec.Command("/usr/bin/pgrep", "-f", holder).Run() == nil }
+
+	if held() {
+		t.Fatal("sleep is prevented without sessions although app.keepAwake is off")
+	}
+	setKeepAwake := func(on bool) {
+		t.Helper()
+		res := d.manage(http.MethodPut, "/mgmt/v1/config", fmt.Sprintf(`{"app": {"keepAwake": %t}}`, on))
+		if res.status != http.StatusOK {
+			t.Fatalf("PUT config: %d %s", res.status, res.body)
+		}
+	}
+	setKeepAwake(true)
+	eventually(t, 5*time.Second, "sleep to be prevented", held)
+	setKeepAwake(false)
+	eventually(t, 5*time.Second, "sleep to be allowed again", func() bool { return !held() })
+
+	setKeepAwake(true)
+	eventually(t, 5*time.Second, "sleep to be prevented", held)
+	d.stop()
+	eventually(t, 5*time.Second, "sleep to be allowed after the service stopped", func() bool { return !held() })
+
+	// The setting is persisted: a restarted service holds from the start.
+	restarted := spec.start(t)
+	holder = fmt.Sprintf("caffeinate -i -w %d", restarted.cmd.Process.Pid)
+	eventually(t, 5*time.Second, "sleep to be prevented after a restart", held)
 }
 
 // Acceptance 13: sessions run in a native, headed browser.

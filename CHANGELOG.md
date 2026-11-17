@@ -25,6 +25,8 @@ The first version intended for use outside development.
 - macOS: menu-bar app that registers and manages a per-user launchd agent.
 - Windows: service running as the unprivileged `NT SERVICE\tabtenderd`
   account, with in-place upgrades.
+- Keeps the machine awake while sessions are active, or optionally for as
+  long as the service runs (`app.keepAwake`), so it stays reachable.
 - Optional Cloudflare quick and named tunnels, supervised with backoff.
 - Configuration through file, environment, and a local management API, with
   live reload.

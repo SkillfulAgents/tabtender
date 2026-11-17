@@ -334,7 +334,7 @@ is in force.
     "sessions": { "defaultTTL": 3600, "maxTTL": 14400, "maxConcurrent": 8 },
     "browser": { "runtime": "chrome", "executablePath": "auto", "headless": false, "extraArgs": [] },
     "tunnel": { "provider": "none", "cloudflare": { "executablePath": "auto", "hostname": "" } },
-    "app": { "startOnLogin": true, "preventSleep": true }
+    "app": { "startOnLogin": true, "preventSleep": true, "keepAwake": false }
   },
   "effective": { "…": "same shape as file, with environment overrides applied" },
   "envOverrides": {

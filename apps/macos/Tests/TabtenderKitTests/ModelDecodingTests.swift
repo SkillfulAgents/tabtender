@@ -55,4 +55,27 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual((reencoded?["tunnel"] as? [String: Any])?["provider"] as? String, "cloudflare-quick")
         XCTAssertEqual((reencoded?["browser"] as? [String: Any])?["extraArgs"] as? [String], [])
     }
+
+    func testSleepPreventionMapsToTheTwoSettings() throws {
+        // No `keepAwake`: what a daemon from before the setting reports.
+        let json = #"{"startOnLogin":true,"preventSleep":true}"#
+        var app = try JSONDecoder().decode(Configuration.App.self, from: Data(json.utf8))
+        XCTAssertFalse(app.keepAwake)
+        XCTAssertEqual(app.sleepPrevention, .whileSessionsAreActive)
+
+        app.sleepPrevention = .always
+        XCTAssertTrue(app.keepAwake)
+        XCTAssertTrue(app.preventSleep)
+
+        app.sleepPrevention = .never
+        XCTAssertFalse(app.keepAwake)
+        XCTAssertFalse(app.preventSleep)
+        XCTAssertEqual(app.sleepPrevention, .never)
+
+        app.sleepPrevention = .whileSessionsAreActive
+        XCTAssertEqual([app.keepAwake, app.preventSleep], [false, true])
+
+        let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(app)) as? [String: Bool]
+        XCTAssertEqual(encoded, ["startOnLogin": true, "preventSleep": true, "keepAwake": false])
+    }
 }

@@ -162,7 +162,7 @@ func run(ctx context.Context, opts Options, paths config.Paths, logger *slog.Log
 		running:  cfg,
 		applied:  cfg,
 		runtimes: opts.Runtimes,
-		power:    power.NewInhibitor(cfg.App.PreventSleep),
+		power:    power.NewInhibitor(powerPolicy(cfg)),
 	}
 	defer d.power.Close()
 
@@ -330,6 +330,10 @@ func (d *Daemon) setupSecrets() error {
 	return nil
 }
 
+func powerPolicy(cfg config.Config) power.Policy {
+	return power.Policy{WhileActive: cfg.App.PreventSleep, Always: cfg.App.KeepAwake}
+}
+
 func limitsFrom(cfg config.Config) sessions.Limits {
 	return sessions.Limits{
 		DefaultTTL:      time.Duration(cfg.Sessions.DefaultTTL) * time.Second,
@@ -438,7 +442,7 @@ func (d *Daemon) UpdateConfig(edit func(*config.Config) error) (config.Snapshot,
 	d.applied = next
 
 	d.sessions.SetLimits(limitsFrom(next))
-	d.power.SetEnabled(next.App.PreventSleep)
+	d.power.SetPolicy(powerPolicy(next))
 
 	if next.Browser.Runtime != prev.Browser.Runtime ||
 		next.Browser.ExecutablePath != prev.Browser.ExecutablePath ||

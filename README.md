@@ -50,6 +50,12 @@ The service keeps running when you quit the menu-bar app, restarts after a
 crash, and starts at login (configurable). The menu-bar app itself does not
 start at login; open it whenever you want to look at the service.
 
+A sleeping Mac answers no requests. By default the service keeps the Mac
+awake only while sessions are active; to keep it reachable between sessions
+too, set **Settings → General → Keep this Mac awake** to **Always**
+(`app.keepAwake`). The display can still sleep, and a laptop still sleeps
+when its lid is closed.
+
 **Updating.** Replace the app and open it once. macOS ties the background
 service to the exact build that registered it, so the app registers the
 service again when it finds an older daemon running or launchd refusing to
@@ -259,6 +265,7 @@ tunnel:
 app:
   startOnLogin: true     # macOS
   preventSleep: true     # keep the machine awake while sessions are active
+  keepAwake: false       # keep it awake whenever the service runs, so it stays reachable
 ```
 
 | Variable                             | Overrides / purpose                          |
