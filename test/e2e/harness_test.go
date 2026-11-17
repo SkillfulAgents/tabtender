@@ -468,6 +468,22 @@ func assertDirRemoved(t *testing.T, dir string) {
 	})
 }
 
+// withoutToken strips the session token from a cdpUrl.
+func withoutToken(cdpURL string) string {
+	base, _, _ := strings.Cut(cdpURL, "?")
+	return base
+}
+
+// tokenOf extracts the session token from a cdpUrl.
+func tokenOf(t *testing.T, cdpURL string) string {
+	t.Helper()
+	_, token, ok := strings.Cut(cdpURL, "?token=")
+	if !ok || token == "" {
+		t.Fatalf("cdpUrl %q carries no token", cdpURL)
+	}
+	return token
+}
+
 // cdpClient is a minimal raw CDP client.
 type cdpClient struct {
 	t    *testing.T

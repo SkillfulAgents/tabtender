@@ -3,8 +3,13 @@ info:
   title: Tabtender API
   summary: Native browser sessions for AI agents over the Chrome DevTools Protocol.
   description: |
-    The public, network-facing API of `tabtenderd`. Every request, including
-    the CDP WebSocket handshake, must carry `Authorization: Bearer <api key>`.
+    The public, network-facing API of `tabtenderd`. Every request must carry
+    `Authorization: Bearer <api key>`. The one exception is a session's CDP
+    WebSocket, which also accepts that session's own token — already included
+    in the `cdpUrl` returned for the session.
+
+    Treat a `cdpUrl` as a secret: anyone holding it controls that session's
+    browser until the session ends, and proxies or tunnels may log URLs.
 
     The local management API (served on a Unix domain socket) is documented in
     [api.md](api.md).
@@ -138,9 +143,15 @@ paths:
       tags: [Sessions]
       operationId: connectCDP
       summary: CDP WebSocket
+      security:
+        - apiKey: []
+        - sessionToken: []
       description: |
         Upgrades to a WebSocket connected to the session's browser-level CDP
-        endpoint. Text and binary messages are relayed verbatim in both
+        endpoint. Authorized by either the API key header or the session's
+        own token in the `token` query parameter (as in `cdpUrl`). A token
+        authorizes only its own session, and stops working when the session
+        ends. Text and binary messages are relayed verbatim in both
         directions. Disconnecting does not end the session, and clients may
         reconnect while it is running. When the session ends, clients are
         closed with status 1001 and reason `session terminated`.
@@ -150,7 +161,11 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
-          $ref: "#/components/responses/SessionNotFound"
+          description: Unknown session, for a request carrying the API key (`session_not_found`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "409":
           description: The session has ended or is not running yet (`session_not_running`).
           content:
@@ -188,7 +203,15 @@ components:
     apiKey:
       type: http
       scheme: bearer
-      description: The Tabtender API key.
+      description: The Tabtender API key. Never accepted in the query string.
+    sessionToken:
+      type: apiKey
+      in: query
+      name: token
+      description: |
+        A session's own token: 256 random bits, base64url-encoded, issued when
+        the session is created and included in its `cdpUrl`. Accepted only on
+        that session's CDP endpoint.
   parameters:
     SessionId:
       name: id
@@ -200,7 +223,7 @@ components:
       example: sess_ru5g7woaasehntbed6f5ygzgqi
   responses:
     Unauthorized:
-      description: Missing or wrong API key (`unauthorized`).
+      description: Missing or wrong credential (`unauthorized`).
       headers:
         WWW-Authenticate:
           schema:
@@ -266,7 +289,11 @@ components:
         cdpUrl:
           type: string
           format: uri
-          description: WebSocket URL of the session's CDP endpoint. Absent once terminated.
+          description: |
+            WebSocket URL of the session's CDP endpoint, including the
+            session's token (`?token=…`), so it can be used without headers.
+            Identical in every response while the session lives. Absent once
+            terminated.
         connectedClients:
           type: integer
           minimum: 0
@@ -285,7 +312,7 @@ components:
         profile: work
         createdAt: "2026-11-17T00:54:16.66132Z"
         expiresAt: "2026-11-17T01:54:17.066109Z"
-        cdpUrl: ws://127.0.0.1:3000/v1/sessions/sess_ru5g7woaasehntbed6f5ygzgqi/cdp
+        cdpUrl: ws://127.0.0.1:3000/v1/sessions/sess_ru5g7woaasehntbed6f5ygzgqi/cdp?token=Zk3vR0hJq8mXw2Lr9tYbA5cNeU7sKd1fGiPoQx4TzHM
         connectedClients: 0
     Health:
       type: object

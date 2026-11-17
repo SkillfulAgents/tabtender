@@ -3,7 +3,10 @@ package sessions
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base32"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -152,6 +155,39 @@ func newSessionID() (string, error) {
 	return "sess_" + strings.ToLower(enc), nil
 }
 
+// newSessionToken returns a URL-safe token carrying 256 bits of entropy.
+func newSessionToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// TokenMatches reports whether token is the CDP token of session id. The
+// comparison is constant-time. Recently ended sessions still match, so that
+// the holder of a once-valid URL can be told the session is over instead of
+// being treated as a stranger; an ended session cannot be connected to
+// either way.
+func (m *Manager) TokenMatches(id, token string) bool {
+	if token == "" {
+		return false
+	}
+	m.mu.Lock()
+	var want string
+	if e, ok := m.active[id]; ok {
+		want = e.session.Token
+	} else if t, ok := m.tombstones[id]; ok {
+		want = t.Token
+	}
+	m.mu.Unlock()
+	if want == "" {
+		return false
+	}
+	presented, expected := sha256.Sum256([]byte(token)), sha256.Sum256([]byte(want))
+	return subtle.ConstantTimeCompare(presented[:], expected[:]) == 1
+}
+
 // resolve validates a request against the limits.
 func (l Limits) resolve(req CreateRequest) (ttl time.Duration, headless bool, err error) {
 	ttl = l.DefaultTTL
@@ -210,9 +246,15 @@ func (m *Manager) Create(ctx context.Context, req CreateRequest) (Session, error
 		m.mu.Unlock()
 		return Session{}, fmt.Errorf("generate session id: %w", err)
 	}
+	token, err := newSessionToken()
+	if err != nil {
+		m.mu.Unlock()
+		return Session{}, fmt.Errorf("generate session token: %w", err)
+	}
 	e := &entry{
 		session: Session{
 			ID:        id,
+			Token:     token,
 			Status:    StatusStarting,
 			Profile:   req.Profile,
 			Headless:  headless,

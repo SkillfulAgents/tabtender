@@ -169,7 +169,7 @@ func TestAdaptersAreReplaceable(t *testing.T) {
 	}
 	remote, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if !strings.Contains(string(remote), `"cdpUrl":"wss://pigeon.example/v1/sessions/`+session.ID+`/cdp"`) {
+	if !strings.Contains(string(remote), `"cdpUrl":"wss://pigeon.example/v1/sessions/`+session.ID+`/cdp?token=`) {
 		t.Fatalf("remote view = %s", remote)
 	}
 

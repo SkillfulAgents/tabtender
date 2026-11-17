@@ -93,7 +93,8 @@ const session = await (await fetch(`${api}/v1/sessions`, {
   body: JSON.stringify({ ttlSeconds: 1800 }),
 })).json();
 
-const browser = await chromium.connectOverCDP(session.cdpUrl, { headers });
+// cdpUrl carries a token for this one session, so it works on its own.
+const browser = await chromium.connectOverCDP(session.cdpUrl);
 const page = await browser.contexts()[0].newPage();
 await page.goto('https://example.com');
 
@@ -101,12 +102,18 @@ await browser.close();                                   // disconnects; the ses
 await fetch(`${api}/v1/sessions/${session.id}`, { method: 'DELETE', headers });
 ```
 
-Puppeteer: `puppeteer.connect({ browserWSEndpoint: session.cdpUrl, headers })`.
+Puppeteer: `puppeteer.connect({ browserWSEndpoint: session.cdpUrl })`.
+
+The `cdpUrl` ends in `?token=…`, a credential scoped to that one session. Hand
+it to a sandboxed agent or any CDP client that cannot set headers — it opens
+that session's CDP endpoint and nothing else, so the API key never has to
+leave your orchestrator.
 
 ## API
 
-Every request — including the CDP WebSocket handshake — must carry
-`Authorization: Bearer <api key>`. This is a summary; the full reference,
+Every request must carry `Authorization: Bearer <api key>`. The one exception
+is a session's CDP WebSocket, which accepts either the API key header or the
+session's own token (already part of its `cdpUrl`). This is a summary; the full reference,
 including the local management API, is in [docs/api.md](docs/api.md), and the
 public API is also described in [docs/openapi.yaml](docs/openapi.yaml).
 
@@ -132,7 +139,7 @@ public API is also described in [docs/openapi.yaml](docs/openapi.yaml).
   "headless": false,
   "createdAt": "2026-11-15T19:30:00Z",
   "expiresAt": "2026-11-15T20:00:00Z",
-  "cdpUrl": "wss://browser.example.com/v1/sessions/sess_pdba4wpt6fg3qx4bgjlmzhn5de/cdp",
+  "cdpUrl": "wss://browser.example.com/v1/sessions/sess_pdba4wpt6fg3qx4bgjlmzhn5de/cdp?token=Zk3…",
   "connectedClients": 0
 }
 ```
@@ -142,7 +149,7 @@ Errors look like `{"error": {"code": "validation_error", "message": "..."}}`:
 | Status | Code                    | Meaning                                         |
 | ------ | ----------------------- | ----------------------------------------------- |
 | 400    | `validation_error`      | Bad request (for example a TTL above the maximum) |
-| 401    | `unauthorized`          | Missing or wrong API key                        |
+| 401    | `unauthorized`          | Missing or wrong API key (or session token, on the CDP endpoint) |
 | 404    | `session_not_found`     | Unknown session                                 |
 | 409    | `profile_in_use`        | The named profile is locked by another session  |
 | 409    | `session_not_running`   | CDP connection to a session that has ended      |
@@ -257,14 +264,24 @@ it if it exits. While a tunnel is up, sessions created through it return
 `wss://` CDP URLs on the public hostname; local callers keep getting local
 URLs. `GET /v1/health` reports the tunnel state and URL.
 
-A tunnel URL is never treated as a credential: the API key is required on
-every request regardless of how it arrives.
+A tunnel URL is never treated as a credential: the API key (or, for a CDP
+connection, the session's token) is required regardless of how a request
+arrives.
 
 ## Security
 
 - A 256-bit API key is generated on first start and stored in the macOS
   Keychain, or on Windows in a DPAPI-encrypted file readable only by SYSTEM
   and Administrators. Keys are compared in constant time and never logged.
+- Each session has its own random 256-bit token, embedded in its `cdpUrl`.
+  It authorizes that session's CDP endpoint only — never the REST API, never
+  another session — is kept in memory only, stays the same for the session's
+  life, and stops working when the session ends. Rotating the API key does
+  not change it. The API key itself is never accepted in a URL.
+- **Treat a `cdpUrl` as a secret.** Anyone holding it controls that session's
+  browser until the session ends, and URLs are easier to leak than headers:
+  reverse proxies, tunnels, and client libraries may log them. Tabtender
+  never logs query strings. To revoke a leaked URL, delete the session.
 - The server binds to loopback by default. Chrome's CDP listeners are always
   loopback-only and never exposed.
 - The local management channel is a Unix socket with owner-only permissions;
@@ -279,7 +296,8 @@ every request regardless of how it arrives.
 
 Sessions give you separate processes and separate browsing state. They are
 **not a security boundary** between mutually untrusted users: everything runs
-as one OS user, and anyone holding the API key controls every session.
+as one OS user, and anyone holding the API key controls every session (a
+session token controls only its own).
 
 ## Architecture
 

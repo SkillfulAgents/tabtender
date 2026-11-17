@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { chromium } from 'playwright-core';
-import { api, authHeaders, createSession, deleteSession, startSite, waitFor } from './helpers.mjs';
+import { api, authHeaders, baseUrl, createSession, deleteSession, startSite, waitFor, withoutToken } from './helpers.mjs';
 
 let site;
 before(async () => {
@@ -14,8 +14,9 @@ after(async () => {
 test('Playwright controls a session through the returned cdpUrl', async () => {
   const session = await createSession();
   try {
-    assert.match(session.cdpUrl, /^wss?:\/\/.+\/v1\/sessions\/sess_[a-z0-9]+\/cdp$/);
-    const browser = await chromium.connectOverCDP(session.cdpUrl, { headers: authHeaders });
+    assert.match(session.cdpUrl, /^wss?:\/\/.+\/v1\/sessions\/sess_[a-z0-9]+\/cdp\?token=[A-Za-z0-9_-]{43}$/);
+    // No headers: the URL is all a client needs.
+    const browser = await chromium.connectOverCDP(session.cdpUrl);
     const context = browser.contexts()[0];
     const page = await context.newPage();
     await page.goto(`${site.url}/hello`);
@@ -30,14 +31,47 @@ test('Playwright controls a session through the returned cdpUrl', async () => {
   }
 });
 
-test('the CDP endpoint rejects connections without a valid API key', async () => {
+test('the API key in a header opens the CDP endpoint without the token', async () => {
   const session = await createSession();
   try {
-    await assert.rejects(chromium.connectOverCDP(session.cdpUrl, { timeout: 10000 }), /401/);
+    const browser = await chromium.connectOverCDP(withoutToken(session.cdpUrl), { headers: authHeaders });
+    const page = await browser.contexts()[0].newPage();
+    assert.equal(await page.evaluate(() => 1 + 1), 2);
+    await browser.close();
+  } finally {
+    await deleteSession(session.id);
+  }
+});
+
+test('the CDP endpoint rejects connections without a valid credential', async () => {
+  const [session, other] = await Promise.all([createSession(), createSession()]);
+  try {
+    const bare = withoutToken(session.cdpUrl);
+    const otherToken = new URL(other.cdpUrl).searchParams.get('token');
+    await assert.rejects(chromium.connectOverCDP(bare, { timeout: 10000 }), /401/);
     await assert.rejects(
-      chromium.connectOverCDP(session.cdpUrl, { headers: { Authorization: 'Bearer wrong-key' }, timeout: 10000 }),
+      chromium.connectOverCDP(bare, { headers: { Authorization: 'Bearer wrong-key' }, timeout: 10000 }),
       /401/,
     );
+    // Another session's token opens only that other session.
+    await assert.rejects(chromium.connectOverCDP(`${bare}?token=${otherToken}`, { timeout: 10000 }), /401/);
+  } finally {
+    await deleteSession(session.id);
+    await deleteSession(other.id);
+  }
+});
+
+test('a session token is not accepted by the REST API', async () => {
+  const session = await createSession();
+  try {
+    const token = new URL(session.cdpUrl).searchParams.get('token');
+    for (const path of ['/v1/sessions', '/v1/health', `/v1/sessions/${session.id}`]) {
+      const response = await fetch(`${baseUrl}${path}?token=${token}`);
+      assert.equal(response.status, 401, path);
+    }
+    // Reading the session again returns the same working URL.
+    const again = await api('GET', `/v1/sessions/${session.id}`);
+    assert.equal(again.body.cdpUrl, session.cdpUrl);
   } finally {
     await deleteSession(session.id);
   }
@@ -112,7 +146,9 @@ test('terminating a session disconnects its clients', async () => {
   assert.equal(deleted.body.status, 'terminated');
   assert.equal(deleted.body.endReason, 'deleted');
   await waitFor(() => disconnected, { what: 'client disconnect' });
-  await assert.rejects(chromium.connectOverCDP(session.cdpUrl, { headers: authHeaders, timeout: 10000 }));
+  // Neither the old URL nor the API key can reach an ended session.
+  await assert.rejects(chromium.connectOverCDP(session.cdpUrl, { timeout: 10000 }), /409/);
+  await assert.rejects(chromium.connectOverCDP(session.cdpUrl, { headers: authHeaders, timeout: 10000 }), /409/);
 });
 
 test('a named profile persists browsing state across sessions', async () => {

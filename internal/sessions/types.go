@@ -35,8 +35,12 @@ const (
 
 // Session is an immutable snapshot of a session's state.
 type Session struct {
-	ID        string
-	Status    Status
+	ID     string
+	Status Status
+	// Token is the session-scoped credential embedded in the session's CDP
+	// URL. It authorizes connecting to this session's CDP endpoint and
+	// nothing else, lives only in memory, and dies with the session.
+	Token     string
 	Profile   string
 	Headless  bool
 	PID       int

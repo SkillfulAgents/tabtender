@@ -38,6 +38,14 @@ export async function createSession(overrides = {}) {
   return body;
 }
 
+// A cdpUrl carries a session-scoped token; this strips it, leaving the bare
+// endpoint that only the API key can open.
+export function withoutToken(cdpUrl) {
+  const url = new URL(cdpUrl);
+  url.search = '';
+  return url.toString();
+}
+
 export async function deleteSession(id) {
   return api('DELETE', `/v1/sessions/${id}`);
 }

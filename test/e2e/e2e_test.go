@@ -355,7 +355,7 @@ func TestAuthenticationIsEnforcedOnTheNetwork(t *testing.T) {
 				t.Errorf("GET %s with key %q: %d", path, key, res.status)
 			}
 		}
-		if _, resp, err := dialCDP(s.CDPURL, key, nil); err == nil || resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		if _, resp, err := dialCDP(withoutToken(s.CDPURL), key, nil); err == nil || resp == nil || resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("CDP handshake with key %q was not rejected with 401 (err=%v)", key, err)
 		}
 	}
@@ -371,6 +371,92 @@ func TestAuthenticationIsEnforcedOnTheNetwork(t *testing.T) {
 	// of any API response.
 	if strings.Contains(string(d.api(http.MethodGet, "/v1/sessions/"+s.ID, "").body), "devtools") {
 		t.Fatal("the raw browser endpoint leaked into the API")
+	}
+}
+
+// A session's cdpUrl is a complete credential for that one session: a client
+// that cannot set headers connects with the URL alone, and the token opens
+// nothing else.
+func TestSessionTokenAuthorizesOnlyItsOwnCDPEndpoint(t *testing.T) {
+	spec := newSpec(t)
+	spec.env["TABTENDER_LOG_LEVEL"] = "debug"
+	d := spec.start(t)
+	a, b := d.createSession(""), d.createSession("")
+	tokenA, tokenB := tokenOf(t, a.CDPURL), tokenOf(t, b.CDPURL)
+
+	conn, _, err := dialCDP(a.CDPURL, "", nil)
+	if err != nil {
+		t.Fatalf("connecting with only the cdpUrl: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.CloseNow() })
+	client := &cdpClient{t: t, conn: conn}
+	target := client.openPage("about:blank")
+	if got := client.evaluate(target, `6 * 7`); got != "42" {
+		t.Fatalf("evaluate over a token-authenticated connection = %s", got)
+	}
+
+	status := func(cdpURL, key string) int {
+		c, resp, err := dialCDP(cdpURL, key, nil)
+		if err == nil {
+			_ = c.CloseNow()
+			return http.StatusSwitchingProtocols
+		}
+		if resp == nil {
+			t.Fatalf("dial: %v", err)
+		}
+		return resp.StatusCode
+	}
+	if got := status(withoutToken(a.CDPURL), ""); got != http.StatusUnauthorized {
+		t.Errorf("URL without its token: %d, want 401", got)
+	}
+	if got := status(withoutToken(b.CDPURL)+"?token="+tokenA, ""); got != http.StatusUnauthorized {
+		t.Errorf("session A's token on session B: %d, want 401", got)
+	}
+	if got := status(withoutToken(a.CDPURL)+"?token="+testAPIKey, ""); got != http.StatusUnauthorized {
+		t.Errorf("API key in the query string: %d, want 401", got)
+	}
+	for _, path := range []string{"/v1/sessions", "/v1/health", "/v1/sessions/" + a.ID} {
+		res := doRequest(t, plainClient, http.MethodGet, d.spec.baseURL()+path+"?token="+tokenA, "", "")
+		if res.status != http.StatusUnauthorized {
+			t.Errorf("GET %s with the session token: %d, want 401", path, res.status)
+		}
+	}
+	if res := doRequest(t, plainClient, http.MethodDelete, d.spec.baseURL()+"/v1/sessions/"+a.ID+"?token="+tokenA, "", ""); res.status != http.StatusUnauthorized {
+		t.Errorf("DELETE with the session token: %d, want 401", res.status)
+	}
+
+	// Every response reports the same URL for the life of the session.
+	if got, _ := d.getSession(a.ID); got.CDPURL != a.CDPURL {
+		t.Errorf("GET returned %q, POST returned %q", got.CDPURL, a.CDPURL)
+	}
+	for _, listed := range d.listSessions() {
+		want := map[string]string{a.ID: a.CDPURL, b.ID: b.CDPURL}[listed.ID]
+		if listed.CDPURL != want {
+			t.Errorf("list returned %q for %s, want %q", listed.CDPURL, listed.ID, want)
+		}
+	}
+
+	// The token dies with the session.
+	d.deleteSession(a.ID)
+	if got := status(a.CDPURL, ""); got != http.StatusConflict {
+		t.Errorf("old URL after delete: %d, want 409 session_not_running", got)
+	}
+	if got, _ := d.getSession(a.ID); got.CDPURL != "" {
+		t.Errorf("a terminated session still reports cdpUrl %q", got.CDPURL)
+	}
+	if got := status(b.CDPURL, ""); got != http.StatusSwitchingProtocols {
+		t.Errorf("session B's own URL: %d", got)
+	}
+
+	// Tokens never reach the log, on the console or in the log file.
+	logFile, _ := os.ReadFile(filepath.Join(spec.dataDir(), "logs", "tabtenderd.log"))
+	for name, text := range map[string]string{"console": d.output.String(), "log file": string(logFile)} {
+		if !strings.Contains(text, "/v1/sessions/"+a.ID+"/cdp") {
+			t.Errorf("%s: expected debug request logging to be active", name)
+		}
+		if strings.Contains(text, tokenA) || strings.Contains(text, tokenB) {
+			t.Errorf("a session token appears in the %s", name)
+		}
 	}
 }
 
@@ -657,10 +743,12 @@ func TestQuickTunnelEndToEnd(t *testing.T) {
 		t.Fatalf("cdpUrl = %q, want prefix %q", s.CDPURL, wantPrefix)
 	}
 
-	if _, resp, err := dialCDP(s.CDPURL, "", client); err == nil || resp == nil || resp.StatusCode != http.StatusUnauthorized {
+	if _, resp, err := dialCDP(withoutToken(s.CDPURL), "", client); err == nil || resp == nil || resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated CDP through the tunnel: err=%v", err)
 	}
-	conn, _, err := dialCDP(s.CDPURL, testAPIKey, client)
+	// The URL alone is enough: this is what a client that cannot set
+	// headers does.
+	conn, _, err := dialCDP(s.CDPURL, "", client)
 	if err != nil {
 		t.Fatalf("CDP through the tunnel: %v", err)
 	}
@@ -672,9 +760,9 @@ func TestQuickTunnelEndToEnd(t *testing.T) {
 	}
 	// Reconnect through the tunnel.
 	cdp.close()
-	again, _, err := dialCDP(s.CDPURL, testAPIKey, client)
+	again, _, err := dialCDP(withoutToken(s.CDPURL), testAPIKey, client)
 	if err != nil {
-		t.Fatalf("reconnect through the tunnel: %v", err)
+		t.Fatalf("reconnect through the tunnel with the API key: %v", err)
 	}
 	defer again.CloseNow() //nolint:errcheck // test
 	if urls := (&cdpClient{t: t, conn: again}).pageURLs(); len(urls) == 0 {

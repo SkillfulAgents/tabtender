@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -71,8 +72,43 @@ func (p staticTunnel) Status() tunnel.TunnelStatus {
 	return tunnel.TunnelStatus{State: tunnel.StateRunning, URL: p.url}
 }
 
+// lockedBuffer is a goroutine-safe log sink.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// withoutToken strips the session token from a cdpUrl.
+func withoutToken(cdpURL string) string {
+	base, _, _ := strings.Cut(cdpURL, "?")
+	return base
+}
+
+// tokenOf extracts the session token from a cdpUrl.
+func tokenOf(t *testing.T, cdpURL string) string {
+	t.Helper()
+	_, token, ok := strings.Cut(cdpURL, "?token=")
+	if !ok || token == "" {
+		t.Fatalf("cdpUrl %q carries no token", cdpURL)
+	}
+	return token
+}
+
 type harness struct {
 	t        *testing.T
+	logText  *lockedBuffer
 	server   *Server
 	public   *httptest.Server
 	mgmt     *httptest.Server
@@ -113,12 +149,14 @@ func newHarness(t *testing.T, env map[string]string) *harness {
 	registry.Register("static", func(cfg tunnel.TunnelConfig) (tunnel.TunnelProvider, error) {
 		return staticTunnel{url: "https://" + cfg.Hostname}, nil
 	})
-	logger, logs, _, err := logging.Setup("", slog.LevelInfo, nil)
+	logText := &lockedBuffer{}
+	logger, logs, _, err := logging.Setup("", slog.LevelDebug, logText)
 	if err != nil {
 		t.Fatal(err)
 	}
 	h := &harness{
 		t:        t,
+		logText:  logText,
 		rt:       rt,
 		keys:     keys,
 		backend:  &fakeBackend{store: store, running: cfg},
@@ -260,7 +298,7 @@ func TestEveryPublicEndpointRequiresAuthentication(t *testing.T) {
 		t.Fatal("an unauthenticated DELETE affected the session")
 	}
 	// WebSocket handshakes are covered by the same check.
-	_, resp, err := h.dial(s.CDPURL, "")
+	_, resp, err := h.dial(withoutToken(s.CDPURL), "")
 	if err == nil || resp == nil || resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated CDP dial: err=%v resp=%v", err, resp)
 	}
@@ -287,7 +325,7 @@ func TestSessionLifecycleOverREST(t *testing.T) {
 	if ttl := created.ExpiresAt.Sub(created.CreatedAt); ttl < 1799*time.Second || ttl > 1802*time.Second {
 		t.Fatalf("ttl = %s", ttl)
 	}
-	wantURL := "ws" + strings.TrimPrefix(h.public.URL, "http") + "/v1/sessions/" + created.ID + "/cdp"
+	wantURL := "ws" + strings.TrimPrefix(h.public.URL, "http") + "/v1/sessions/" + created.ID + "/cdp?token=" + tokenOf(t, created.CDPURL)
 	if created.CDPURL != wantURL {
 		t.Fatalf("cdpUrl = %q, want %q", created.CDPURL, wantURL)
 	}
@@ -497,6 +535,236 @@ func TestTerminatingASessionClosesItsClients(t *testing.T) {
 	}
 }
 
+// dialStatus attempts a CDP handshake and returns the HTTP status it got
+// (101 when the WebSocket was established).
+func (h *harness) dialStatus(cdpURL, apiKey string) int {
+	h.t.Helper()
+	conn, resp, err := h.dial(cdpURL, apiKey)
+	if err == nil {
+		_ = conn.CloseNow()
+		return http.StatusSwitchingProtocols
+	}
+	if resp == nil {
+		h.t.Fatalf("dial %s: %v", cdpURL, err)
+	}
+	return resp.StatusCode
+}
+
+func TestSessionTokenConnectsWithoutAHeader(t *testing.T) {
+	h := newHarness(t, nil)
+	s := h.createSession("")
+	token := tokenOf(t, s.CDPURL)
+	// 256 bits, base64url without padding.
+	if !regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`).MatchString(token) {
+		t.Fatalf("token %q is not 256 bits of base64url", token)
+	}
+
+	conn, _, err := h.dial(s.CDPURL, "")
+	if err != nil {
+		t.Fatalf("connecting with only the cdpUrl failed: %v", err)
+	}
+	defer conn.CloseNow() //nolint:errcheck // test
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := conn.Write(ctx, websocket.MessageText, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if _, data, err := conn.Read(ctx); err != nil || string(data) != "hello" {
+		t.Fatalf("echo through a token-authenticated connection: %q %v", data, err)
+	}
+	// The token is consumed by the proxy and never forwarded to the browser.
+	for _, handshake := range h.rt.Instances()[0].Handshakes() {
+		if handshake.Get("Authorization") != "" {
+			t.Fatal("credentials were forwarded to the browser")
+		}
+	}
+	// Header authentication keeps working, with or without the token.
+	if got := h.dialStatus(withoutToken(s.CDPURL), h.keys.Key()); got != http.StatusSwitchingProtocols {
+		t.Fatalf("header-authenticated dial: %d", got)
+	}
+}
+
+func TestSessionTokenIsScopedToItsOwnSession(t *testing.T) {
+	h := newHarness(t, nil)
+	a, b := h.createSession(""), h.createSession("")
+	tokenA, tokenB := tokenOf(t, a.CDPURL), tokenOf(t, b.CDPURL)
+	if tokenA == tokenB {
+		t.Fatal("two sessions share a token")
+	}
+	cases := map[string]string{
+		"no credentials":           withoutToken(a.CDPURL),
+		"empty token":              withoutToken(a.CDPURL) + "?token=",
+		"another session's token":  withoutToken(a.CDPURL) + "?token=" + tokenB,
+		"truncated token":          withoutToken(a.CDPURL) + "?token=" + tokenA[:len(tokenA)-1],
+		"API key in the query":     withoutToken(a.CDPURL) + "?token=" + h.keys.Key(),
+		"token on unknown session": strings.Replace(a.CDPURL, a.ID, "sess_unknown", 1),
+	}
+	for name, cdpURL := range cases {
+		_, resp, err := h.dial(cdpURL, "")
+		if err == nil || resp == nil || resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s: err=%v resp=%v, want 401", name, err, resp)
+			continue
+		}
+		if resp.Header.Get("WWW-Authenticate") == "" {
+			t.Errorf("%s: missing WWW-Authenticate header", name)
+		}
+	}
+	if len(h.rt.Instances()[0].Handshakes()) != 0 {
+		t.Fatal("an unauthorized client reached session A's browser")
+	}
+}
+
+func TestSessionTokenIsRejectedEverywhereElse(t *testing.T) {
+	h := newHarness(t, nil)
+	s := h.createSession("")
+	query := "?token=" + tokenOf(t, s.CDPURL)
+	endpoints := []struct{ method, path string }{
+		{http.MethodPost, "/v1/sessions"},
+		{http.MethodGet, "/v1/sessions"},
+		{http.MethodGet, "/v1/sessions/" + s.ID},
+		{http.MethodDelete, "/v1/sessions/" + s.ID},
+		{http.MethodGet, "/v1/health"},
+		{http.MethodGet, "/mgmt/v1/apikey"},
+		// Only GET on the CDP endpoint is token-authorized.
+		{http.MethodDelete, "/v1/sessions/" + s.ID + "/cdp"},
+		{http.MethodPost, "/v1/sessions/" + s.ID + "/cdp"},
+	}
+	for _, e := range endpoints {
+		resp := h.do(h.public.URL, e.method, e.path+query, "", "")
+		if resp.status != http.StatusUnauthorized || resp.errorCode(t) != "unauthorized" {
+			t.Errorf("%s %s with the session token: %d %s", e.method, e.path, resp.status, resp.raw)
+		}
+		// The token in a bearer header is not an API key either.
+		resp = h.do(h.public.URL, e.method, e.path, tokenOf(t, s.CDPURL), "")
+		if resp.status != http.StatusUnauthorized {
+			t.Errorf("%s %s with the session token as bearer: %d", e.method, e.path, resp.status)
+		}
+	}
+	if got, _ := h.sessions.Get(s.ID); got.Status != sessions.StatusRunning {
+		t.Fatal("the session token was able to affect the session")
+	}
+	// The API key is never accepted in the query string.
+	if resp := h.do(h.public.URL, http.MethodGet, "/v1/health?token="+h.keys.Key(), "", ""); resp.status != http.StatusUnauthorized {
+		t.Fatalf("API key in the query string was accepted: %d", resp.status)
+	}
+}
+
+func TestSessionTokenIsStableAcrossResponses(t *testing.T) {
+	h := newHarness(t, nil)
+	created := h.createSession("")
+	h.createSession("")
+
+	var got sessionResponse
+	h.api(http.MethodGet, "/v1/sessions/"+created.ID, "").decode(t, &got)
+	var list struct{ Sessions []sessionResponse }
+	h.api(http.MethodGet, "/v1/sessions", "").decode(t, &list)
+	if len(list.Sessions) != 2 || list.Sessions[0].ID != created.ID {
+		t.Fatalf("list = %+v", list.Sessions)
+	}
+	for name, cdpURL := range map[string]string{"get": got.CDPURL, "list": list.Sessions[0].CDPURL} {
+		if cdpURL != created.CDPURL {
+			t.Errorf("%s returned %q, create returned %q", name, cdpURL, created.CDPURL)
+		}
+	}
+	if tokenOf(t, list.Sessions[1].CDPURL) == tokenOf(t, created.CDPURL) {
+		t.Fatal("sessions share a token")
+	}
+	// Reading the session again, much later, still yields the working URL.
+	if h.dialStatus(got.CDPURL, "") != http.StatusSwitchingProtocols {
+		t.Fatal("the URL from a later read does not connect")
+	}
+}
+
+func TestSessionTokenDiesWithTheSession(t *testing.T) {
+	h := newHarness(t, nil)
+	s := h.createSession("")
+	other := h.createSession("")
+	if h.dialStatus(s.CDPURL, "") != http.StatusSwitchingProtocols {
+		t.Fatal("token did not work while the session was running")
+	}
+	deleted := h.api(http.MethodDelete, "/v1/sessions/"+s.ID, "")
+	if strings.Contains(string(deleted.raw), "token") || strings.Contains(string(deleted.raw), "cdpUrl") {
+		t.Fatalf("a terminated session still exposes its URL: %s", deleted.raw)
+	}
+	if strings.Contains(string(h.api(http.MethodGet, "/v1/sessions/"+s.ID, "").raw), tokenOf(t, s.CDPURL)) {
+		t.Fatal("the token is still returned for a terminated session")
+	}
+
+	// The holder of the old URL is told the session is over, exactly as an
+	// API-key holder is; nobody can connect.
+	if got := h.dialStatus(s.CDPURL, ""); got != http.StatusConflict {
+		t.Fatalf("old URL after delete: %d, want 409", got)
+	}
+	if got := h.dialStatus(withoutToken(s.CDPURL), h.keys.Key()); got != http.StatusConflict {
+		t.Fatalf("API key on the ended session: %d, want 409", got)
+	}
+	// A stranger learns nothing about the ended session.
+	if got := h.dialStatus(withoutToken(s.CDPURL)+"?token="+tokenOf(t, other.CDPURL), ""); got != http.StatusUnauthorized {
+		t.Fatalf("wrong token on the ended session: %d, want 401", got)
+	}
+	// And the dead token is no good for a live session.
+	if got := h.dialStatus(withoutToken(other.CDPURL)+"?token="+tokenOf(t, s.CDPURL), ""); got != http.StatusUnauthorized {
+		t.Fatalf("dead token on a live session: %d, want 401", got)
+	}
+}
+
+func TestAPIKeyRotationLeavesSessionTokensWorking(t *testing.T) {
+	h := newHarness(t, nil)
+	s := h.createSession("")
+	conn := h.mustDial(s) // an established connection is not disturbed either
+	oldKey := h.keys.Key()
+	if resp := h.manage(http.MethodPost, "/mgmt/v1/apikey/rotate", ""); resp.status != http.StatusOK {
+		t.Fatalf("rotate: %d", resp.status)
+	}
+	if h.dialStatus(s.CDPURL, "") != http.StatusSwitchingProtocols {
+		t.Fatal("the session token stopped working after API key rotation")
+	}
+	var got sessionResponse
+	h.api(http.MethodGet, "/v1/sessions/"+s.ID, "").decode(t, &got)
+	if got.CDPURL != s.CDPURL {
+		t.Fatal("API key rotation changed the session's cdpUrl")
+	}
+	if got := h.dialStatus(withoutToken(s.CDPURL), oldKey); got != http.StatusUnauthorized {
+		t.Fatalf("the old API key still opens CDP connections: %d", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := conn.Write(ctx, websocket.MessageText, []byte("still here")); err != nil {
+		t.Fatal(err)
+	}
+	if _, data, err := conn.Read(ctx); err != nil || string(data) != "still here" {
+		t.Fatalf("existing connection after rotation: %q %v", data, err)
+	}
+}
+
+func TestSessionTokensAreNeverLogged(t *testing.T) {
+	h := newHarness(t, nil)
+	s := h.createSession(`{"profile": "logged"}`)
+	token := tokenOf(t, s.CDPURL)
+
+	// Exercise every path that sees the token: success, failures, reads.
+	h.mustDial(s)
+	h.dialStatus(withoutToken(s.CDPURL)+"?token="+token+"x", "")
+	h.do(h.public.URL, http.MethodGet, "/v1/health?token="+token, "", "")
+	h.api(http.MethodGet, "/v1/sessions", "")
+	h.manage(http.MethodGet, "/v1/sessions/"+s.ID, "")
+	h.api(http.MethodDelete, "/v1/sessions/"+s.ID, "")
+	h.dialStatus(s.CDPURL, "")
+
+	if text := h.logText.String(); strings.Contains(text, token) {
+		t.Fatalf("the session token appears in the log:\n%s", text)
+	} else if !strings.Contains(text, "/v1/sessions/"+s.ID+"/cdp") {
+		t.Fatal("expected the CDP requests to be logged (without their query)")
+	}
+	// The management API's log buffer is clean too.
+	if logs := h.manage(http.MethodGet, "/mgmt/v1/logs?level=debug&limit=1000", ""); strings.Contains(string(logs.raw), token) {
+		t.Fatalf("the session token appears in the management log buffer: %s", logs.raw)
+	}
+	if strings.Contains(h.logText.String(), h.keys.Key()) {
+		t.Fatal("the API key appears in the log")
+	}
+}
+
 func TestBrowserInitiatedCloseIsPropagated(t *testing.T) {
 	h := newHarness(t, nil)
 	s := h.createSession("")
@@ -541,12 +809,15 @@ func TestCDPURLSelection(t *testing.T) {
 	get := func(headers ...string) string {
 		var got sessionResponse
 		h.api(http.MethodGet, "/v1/sessions/"+s.ID, "", headers...).decode(t, &got)
-		return strings.TrimSuffix(got.CDPURL, "/v1/sessions/"+s.ID+"/cdp")
+		return strings.TrimSuffix(withoutToken(got.CDPURL), "/v1/sessions/"+s.ID+"/cdp")
 	}
 	viaMgmt := func() string {
 		var got sessionResponse
 		h.manage(http.MethodGet, "/v1/sessions/"+s.ID, "").decode(t, &got)
-		return strings.TrimSuffix(got.CDPURL, "/v1/sessions/"+s.ID+"/cdp")
+		if tokenOf(t, got.CDPURL) != tokenOf(t, s.CDPURL) {
+			t.Errorf("the management channel reports a different token")
+		}
+		return strings.TrimSuffix(withoutToken(got.CDPURL), "/v1/sessions/"+s.ID+"/cdp")
 	}
 
 	// No tunnel: echo the address the caller used.

@@ -4,7 +4,7 @@ Tabtender has two HTTP APIs, both served by `tabtenderd`:
 
 | API | Transport | Authentication | Audience |
 | --- | --- | --- | --- |
-| [Public API](#public-api) | TCP (`server.host:server.port`, default `127.0.0.1:3000`), and the tunnel if one is enabled | API key | Agents and automation clients |
+| [Public API](#public-api) | TCP (`server.host:server.port`, default `127.0.0.1:3000`), and the tunnel if one is enabled | API key; a session's CDP endpoint also accepts that session's token | Agents and automation clients |
 | [Management API](#management-api) | Unix domain socket (macOS and Linux only) | Same OS user as the service | The macOS app and local administration |
 
 A machine-readable description of the public API is in [`openapi.yaml`](openapi.yaml).
@@ -32,7 +32,7 @@ Every error response has the same shape:
 | Status | Code | Meaning |
 | --- | --- | --- |
 | 400 | `validation_error` | Malformed body, unknown field, or a value outside its limits |
-| 401 | `unauthorized` | Missing or wrong API key (public API only) |
+| 401 | `unauthorized` | Missing or wrong credential (public API only) |
 | 404 | `not_found` | No such endpoint |
 | 404 | `session_not_found` | Unknown session ID |
 | 409 | `profile_in_use` | The named profile is locked by another session |
@@ -53,16 +53,42 @@ The management API additionally uses `environment_controlled` (409),
 
 ### Authentication
 
-Every request, including the CDP WebSocket handshake, must carry the API key:
+There are two credentials.
+
+**The API key** authorizes everything. Send it as a header on every request:
 
 ```
 Authorization: Bearer <api key>
 ```
 
-Requests without a valid key get `401 unauthorized` with a
+It is never accepted in the query string.
+
+**A session token** authorizes exactly one thing: connecting to one session's
+[CDP WebSocket](#get-v1sessionsidcdp--cdp-websocket). It exists for CDP
+clients that cannot set headers on a WebSocket handshake, and for handing a
+session to a component that must not hold the API key (an agent in a
+sandbox, for example).
+
+- Every session gets its own token: 256 random bits, base64url-encoded (43
+  characters). It is already part of the session's `cdpUrl`, as
+  `?token=<token>`, so a client connects with the URL as given.
+- It is the same in every response for the whole life of the session; reading
+  the session again returns the same working URL. It is kept in memory only.
+- It is accepted on `GET /v1/sessions/{id}/cdp` for its own session, and
+  nowhere else. On every other endpoint — and on another session's CDP
+  endpoint — it is ignored, and the request needs the API key.
+- It stops working when the session ends, however it ends. Rotating the API
+  key does not change it or disconnect anyone.
+
+Requests without a valid credential get `401 unauthorized` with a
 `WWW-Authenticate: Bearer realm="tabtender"` header — whatever the path, so an
-unauthenticated caller cannot tell which endpoints or sessions exist. The key
-is not accepted in the query string.
+unauthenticated caller cannot tell which endpoints or sessions exist.
+
+> **Treat a `cdpUrl` as a secret.** Anyone who holds it controls that
+> session's browser until the session ends. URLs leak more easily than
+> headers: reverse proxies, tunnels, and client libraries may write them to
+> logs. Tabtender itself never logs query strings. To revoke a URL, delete
+> the session.
 
 ### The session object
 
@@ -74,7 +100,7 @@ is not accepted in the query string.
   "profile": "work",
   "createdAt": "2026-11-17T00:54:16.66132Z",
   "expiresAt": "2026-11-17T01:54:17.066109Z",
-  "cdpUrl": "ws://127.0.0.1:3000/v1/sessions/sess_ru5g7woaasehntbed6f5ygzgqi/cdp",
+  "cdpUrl": "ws://127.0.0.1:3000/v1/sessions/sess_ru5g7woaasehntbed6f5ygzgqi/cdp?token=Zk3vR0hJq8mXw2Lr9tYbA5cNeU7sKd1fGiPoQx4TzHM",
   "connectedClients": 0
 }
 ```
@@ -87,7 +113,7 @@ is not accepted in the query string.
 | `profile` | string | Named persistent profile. Omitted for ephemeral sessions |
 | `createdAt` | timestamp | When the session was requested |
 | `expiresAt` | timestamp | When the TTL ends. The TTL starts once the browser is ready, so `expiresAt - createdAt` is the TTL plus the browser's launch time |
-| `cdpUrl` | string | WebSocket URL of the session's CDP endpoint. Omitted once `terminated` |
+| `cdpUrl` | string | WebSocket URL of the session's CDP endpoint, including the session's token (`?token=…`). Usable as is, with no headers. Identical in every response while the session lives; omitted once `terminated` |
 | `connectedClients` | integer | CDP clients currently connected |
 | `endedAt` | timestamp | Only when `terminated` |
 | `endReason` | string | Only when `terminated`: `deleted`, `expired`, `crashed` (the browser exited by itself), or `shutdown` (the service stopped) |
@@ -101,8 +127,8 @@ is not accepted in the query string.
 4. Otherwise you get a URL on the `Host` you used — `wss://` if the request
    arrived over TLS or with `X-Forwarded-Proto: https`, else `ws://`.
 
-The browser's own CDP port is bound to loopback and never appears in any
-response.
+The session's token is then appended as the `token` query parameter. The
+browser's own CDP port is bound to loopback and never appears in any response.
 
 ### `POST /v1/sessions` — create a session
 
@@ -168,6 +194,10 @@ Responses: `200` with the terminated session object; `404 session_not_found`
 Upgrades to a WebSocket connected to the session's browser-level CDP endpoint
 (the equivalent of Chrome's `/devtools/browser/<id>`).
 
+Authorized by **either** the session's token in the query string — which is
+what `cdpUrl` already contains — **or** the API key in an `Authorization`
+header (then the token may be omitted).
+
 - Text and binary messages are relayed verbatim in both directions and never
   inspected. There is no message size limit.
 - Any number of clients may connect to one session.
@@ -180,14 +210,24 @@ Upgrades to a WebSocket connected to the session's browser-level CDP endpoint
   through with its original status code and reason.
 
 ```js
-const browser = await chromium.connectOverCDP(session.cdpUrl, {
+// With the URL alone:
+const browser = await chromium.connectOverCDP(session.cdpUrl);
+
+// Or with the API key, token optional:
+const browser = await chromium.connectOverCDP(bareCdpUrl, {
   headers: { Authorization: `Bearer ${apiKey}` },
 });
 ```
 
-Handshake errors are ordinary HTTP responses: `401 unauthorized`; `404
-session_not_found`; `409 session_not_running`; `426 upgrade_required`; `502
-browser_unreachable`.
+Handshake errors are ordinary HTTP responses:
+
+| Status | When |
+| --- | --- |
+| `401 unauthorized` | No valid credential: no token and no API key, a wrong token, another session's token, or a token for a session the service does not know |
+| `404 session_not_found` | Valid API key, unknown session |
+| `409 session_not_running` | The session has ended (or is still starting). Returned to the API key, and to the session's own former token for ten minutes after it ended, so the holder of a URL can tell "over" from "wrong" |
+| `426 upgrade_required` | Not a WebSocket upgrade |
+| `502 browser_unreachable` | The browser did not accept the connection |
 
 ### `GET /v1/health` — health and capacity
 
@@ -236,7 +276,8 @@ curl --unix-socket "$SOCK" http://tabtender/mgmt/v1/status
 (The host name in the URL is ignored.)
 
 Every [public endpoint](#public-api) is also served on this socket, without a
-key. `cdpUrl` values returned there use the tunnel's URL when a tunnel is up,
+key (so the `cdpUrl` values it returns include session tokens, like any other
+response). `cdpUrl` values returned there use the tunnel's URL when a tunnel is up,
 and the service's local address otherwise.
 
 ### `GET /mgmt/v1/status`
@@ -339,7 +380,8 @@ Responses:
 
 Generates a new 256-bit key, stores it, and returns it in the same shape as
 `GET /mgmt/v1/apikey`. The old key stops working immediately; existing CDP
-connections stay open.
+connections stay open, and sessions' tokens (and therefore their `cdpUrl`s)
+are unaffected.
 
 Responses: `200`; `409 environment_controlled` when the key is pinned by
 `TABTENDER_API_KEY`.
@@ -406,4 +448,5 @@ first.
 ```
 
 `attrs` values are always strings; the field is omitted when an entry has no
-attributes. Credentials are never logged.
+attributes. Credentials are never logged: neither the API key nor session
+tokens (request query strings are not logged at all).

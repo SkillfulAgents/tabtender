@@ -96,15 +96,56 @@ func (s *Server) registerSessionRoutes(mux *http.ServeMux) {
 	})
 }
 
-// PublicHandler serves the network-facing API. Every request, including CDP
-// WebSocket handshakes, must carry a valid bearer token.
+// PublicHandler serves the network-facing API. Every request must carry the
+// API key as a bearer token. The one exception is a session's CDP endpoint,
+// which also accepts that session's own token (see cdpTokenAuthorizes).
 func (s *Server) PublicHandler() http.Handler {
 	mux := http.NewServeMux()
 	s.registerSessionRoutes(mux)
 	authenticate := auth.Middleware(s.Keys, func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "a valid API key is required: Authorization: Bearer <key>")
 	})
-	return s.logRequests("api", authenticate(mux))
+	authenticated := authenticate(mux)
+	return s.logRequests("api", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.cdpTokenAuthorizes(r) {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		authenticated.ServeHTTP(w, r)
+	}))
+}
+
+// cdpTokenParam is the query parameter carrying a session's CDP token.
+const cdpTokenParam = "token"
+
+// cdpSessionID returns the session addressed by a CDP endpoint request.
+func cdpSessionID(r *http.Request) (string, bool) {
+	if r.Method != http.MethodGet {
+		return "", false
+	}
+	rest, ok := strings.CutPrefix(r.URL.Path, "/v1/sessions/")
+	if !ok {
+		return "", false
+	}
+	id, ok := strings.CutSuffix(rest, "/cdp")
+	if !ok || id == "" || strings.Contains(id, "/") {
+		return "", false
+	}
+	return id, true
+}
+
+// cdpTokenAuthorizes reports whether the request is for a session's CDP
+// endpoint and carries that session's token. Clients that cannot set HTTP
+// headers on a WebSocket handshake authenticate this way, with a credential
+// that is scoped to a single session and never to the API as a whole: the
+// token is not looked at for any other endpoint, and the API key is never
+// accepted in the query string.
+func (s *Server) cdpTokenAuthorizes(r *http.Request) bool {
+	id, ok := cdpSessionID(r)
+	if !ok {
+		return false
+	}
+	return s.Sessions.TokenMatches(id, r.URL.Query().Get(cdpTokenParam))
 }
 
 // ManagementHandler serves the local management channel. Callers are
@@ -133,8 +174,9 @@ func (r *statusRecorder) WriteHeader(code int) {
 
 func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
-// logRequests logs method, path, and outcome. Headers are never logged, so
-// credentials cannot leak into the log.
+// logRequests logs method, path, and outcome. Neither headers nor query
+// strings are logged, so the API key and session tokens cannot leak into
+// the log.
 func (s *Server) logRequests(channel string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -256,7 +298,7 @@ func (s *Server) sessionResponse(r *http.Request, sess sessions.Session) session
 		ended := sess.EndedAt
 		resp.EndedAt = &ended
 	} else {
-		resp.CDPURL = s.cdpBaseURL(r) + "/v1/sessions/" + sess.ID + "/cdp"
+		resp.CDPURL = s.cdpBaseURL(r) + "/v1/sessions/" + sess.ID + "/cdp?" + cdpTokenParam + "=" + sess.Token
 	}
 	return resp
 }

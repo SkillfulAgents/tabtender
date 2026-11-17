@@ -116,6 +116,55 @@ func TestCreateStartsAnIsolatedBrowser(t *testing.T) {
 	}
 }
 
+func TestSessionTokens(t *testing.T) {
+	f := newFixture(t, nil)
+	a, b := f.mustCreate(t, CreateRequest{}), f.mustCreate(t, CreateRequest{})
+	if !regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`).MatchString(a.Token) {
+		t.Fatalf("token %q is not 256 bits of URL-safe base64", a.Token)
+	}
+	if a.Token == b.Token {
+		t.Fatal("sessions share a token")
+	}
+	if got, _ := f.Get(a.ID); got.Token != a.Token {
+		t.Fatal("the token changed during the session's life")
+	}
+	if !f.TokenMatches(a.ID, a.Token) {
+		t.Fatal("a session's own token must match")
+	}
+	for name, ok := range map[string]bool{
+		"another session's token": f.TokenMatches(a.ID, b.Token),
+		"empty token":             f.TokenMatches(a.ID, ""),
+		"unknown session":         f.TokenMatches("sess_unknown", a.Token),
+		"empty against unknown":   f.TokenMatches("sess_unknown", ""),
+		"prefix":                  f.TokenMatches(a.ID, a.Token[:20]),
+	} {
+		if ok {
+			t.Errorf("%s matched", name)
+		}
+	}
+
+	// The token is not part of what survives a daemon restart.
+	raw, err := os.ReadFile(filepath.Join(f.dir, "state", "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), a.Token) || strings.Contains(string(raw), b.Token) {
+		t.Fatal("session tokens were written to disk")
+	}
+
+	// After the session ends it cannot be attached to, token or not; the
+	// token still identifies its former holder so they can be told why.
+	if err := f.Terminate(context.Background(), a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Attach(a.ID); err == nil {
+		t.Fatal("an ended session accepted a client")
+	}
+	if !f.TokenMatches(a.ID, a.Token) || f.TokenMatches(a.ID, b.Token) {
+		t.Fatal("unexpected token matching for an ended session")
+	}
+}
+
 func TestSessionIDsAreUnique(t *testing.T) {
 	seen := map[string]bool{}
 	for range 200 {
