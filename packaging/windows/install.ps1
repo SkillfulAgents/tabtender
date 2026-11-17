@@ -72,6 +72,14 @@ trap {
     exit 1
 }
 
+# Started below PowerShell 7 (for instance from a Command Prompt opened there),
+# Windows PowerShell inherits a module path that points at PowerShell 7's
+# modules and fails to load them. Drop those entries before any module loads.
+if ($PSVersionTable.PSEdition -ne 'Core') {
+    $env:PSModulePath = (@($env:PSModulePath -split ';' | Where-Object { $_ -and $_ -notmatch '(^|\\)PowerShell\\' }) +
+        "$PSHOME\Modules") -join ';'
+}
+
 $ServiceName = 'tabtenderd'
 $ServiceAccount = "NT SERVICE\$ServiceName"
 $ServiceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
@@ -120,12 +128,24 @@ function ConvertTo-EnvironmentTable {
     $table
 }
 
+# Reads owner and permissions through .NET. Get-Acl would do, but it lives in
+# a module, and this script should depend on as few of those as it can.
+function Get-Security {
+    param([string]$Path)
+    $sections = [Security.AccessControl.AccessControlSections]'Owner, Access'
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        New-Object Security.AccessControl.DirectorySecurity $Path, $sections
+    } else {
+        New-Object Security.AccessControl.FileSecurity $Path, $sections
+    }
+}
+
 # Reports whether a directory is cut off from its parent's permissions, is
 # owned by a trusted account, and grants nothing beyond read access to
 # anybody else.
 function Test-Restricted {
     param([string]$Path, [string[]]$ReadOnlySids)
-    $acl = Get-Acl -LiteralPath $Path
+    $acl = Get-Security $Path
     if (-not $acl.AreAccessRulesProtected) { return $false }
     if ($acl.GetOwner($SidType).Value -notin $TrustedSids) { return $false }
     foreach ($rule in $acl.GetAccessRules($true, $true, $SidType)) {
@@ -153,7 +173,7 @@ function Get-UntrustedEntry {
                 "$($entry.FullName) (a link)"
                 continue
             }
-            $owner = (Get-Acl -LiteralPath $entry.FullName).GetOwner($SidType).Value
+            $owner = (Get-Security $entry.FullName).GetOwner($SidType).Value
             if ($owner -notin $TrustedSids) {
                 "$($entry.FullName) (owned by $(Resolve-SidName $owner))"
             } elseif ($entry.PSIsContainer) {
@@ -190,7 +210,7 @@ function Initialize-RestrictedDirectory {
         if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
             throw "$Path exists and is not a plain directory."
         }
-        $owner = (Get-Acl -LiteralPath $Path).GetOwner($SidType).Value
+        $owner = (Get-Security $Path).GetOwner($SidType).Value
         if ($owner -notin $TrustedSids) {
             throw ("$Path already exists and is owned by $(Resolve-SidName $owner), not by an administrator. " +
                 'Its contents cannot be trusted. Inspect and delete it, then run the installer again.')
@@ -207,7 +227,7 @@ function Initialize-RestrictedDirectory {
         # them again would needlessly re-propagate them through a tree the
         # service account has been writing to.
         $wanted = $dacl.GetAccessRules($true, $false, $SidType) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique
-        $present = (Get-Acl -LiteralPath $Path).GetAccessRules($true, $true, $SidType) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique
+        $present = (Get-Security $Path).GetAccessRules($true, $true, $SidType) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique
         if (-not $wasRestricted -or "$wanted" -ne "$present") {
             if ($core) {
                 [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]$Path, $dacl)
@@ -355,11 +375,18 @@ function Write-StartDiagnostics {
     Write-Host '--- service status ---'
     & sc.exe queryex $ServiceName | ForEach-Object { Write-Host $_ }
     Write-Host '--- recent service events ---'
-    Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager' } -MaxEvents 200 -ErrorAction SilentlyContinue |
-        Where-Object { $_.Message -match "Tabtender|$ServiceName" } | Select-Object -First 5 |
-        ForEach-Object { Write-Host "$($_.TimeCreated.ToString('s')) $($_.Message)" }
-    Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = $ServiceName } -MaxEvents 3 -ErrorAction SilentlyContinue |
-        ForEach-Object { Write-Host "$($_.TimeCreated.ToString('s')) $($_.Message)" }
+    # Best effort: a problem reading the event log must not replace the
+    # error being diagnosed.
+    try {
+        Get-WinEvent -LogName System -MaxEvents 300 -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -eq 'Service Control Manager' -and $_.Message -match "Tabtender|$ServiceName" } |
+            Select-Object -First 5 | ForEach-Object { Write-Host "$($_.TimeCreated.ToString('s')) $($_.Message)" }
+        Get-WinEvent -LogName Application -MaxEvents 300 -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -eq $ServiceName } |
+            Select-Object -First 3 | ForEach-Object { Write-Host "$($_.TimeCreated.ToString('s')) $($_.Message)" }
+    } catch {
+        Write-Host "(could not read the event log: $($_.Exception.Message))"
+    }
     Write-Host "--- $LogFile (tail) ---"
     if (Test-Path -LiteralPath $LogFile) {
         Get-Content -LiteralPath $LogFile -Tail 40 | ForEach-Object { Write-Host $_ }
@@ -478,7 +505,7 @@ if ($NoStart) {
             throw "The service started but did not write $initialKeyFile."
         }
     } catch {
-        Write-StartDiagnostics $logFile
+        try { Write-StartDiagnostics $logFile } catch { Write-Host "(diagnostics failed: $($_.Exception.Message))" }
         throw
     }
     Write-Host "Tabtender is running at $url"

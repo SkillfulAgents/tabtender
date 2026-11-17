@@ -38,7 +38,7 @@ Every error response has the same shape:
 | 409 | `profile_in_use` | The named profile is locked by another session |
 | 409 | `session_not_running` | CDP connection to a session that has ended or is not running yet |
 | 426 | `upgrade_required` | The CDP endpoint was requested without a WebSocket upgrade |
-| 429 | `capacity_exceeded` | `sessions.maxConcurrent` sessions already exist |
+| 429 | `capacity_exceeded` | `sessions.maxConcurrent` sessions already exist, or a session has its maximum of CDP clients |
 | 500 | `internal_error` | Unexpected failure |
 | 502 | `browser_launch_failed` | The browser could not be started (for example, Chrome is not installed) |
 | 502 | `browser_unreachable` | The session's browser did not accept the CDP connection |
@@ -210,7 +210,8 @@ header (then the token may be omitted).
 - Messages are JSON, as CDP defines them. Messages from the browser arrive as
   text frames; from the client, text and binary frames are both accepted. A
   frame that is not a JSON object closes the connection with status `1007`.
-- Any number of clients may connect to one session. A client that stops
+- Up to 64 clients may be connected to one session at a time (more get
+  `429 capacity_exceeded`). A client that stops
   reading while the browser keeps producing output for it is disconnected
   once 256 MiB are waiting.
 - Disconnecting does not end the session; reconnect to the same URL at any
@@ -238,6 +239,7 @@ Handshake errors are ordinary HTTP responses:
 | `404 session_not_found` | Valid API key, unknown session |
 | `409 session_not_running` | The session has ended (or is still starting). Returned to the API key, and to the session's own former token for ten minutes after it ended, so the holder of a URL can tell "over" from "wrong" |
 | `426 upgrade_required` | Not a WebSocket upgrade |
+| `429 capacity_exceeded` | The session already has 64 clients connected |
 | `502 browser_unreachable` | The browser did not answer |
 
 ### `GET /v1/health` — health and capacity

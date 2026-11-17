@@ -154,7 +154,13 @@ jobs:
         run: npm ci
       - name: Service lifecycle through the Service Control Manager
         shell: pwsh
-        run: packaging/windows/e2e-service.ps1 -BinaryPath dist/tabtender-windows-amd64/tabtenderd.exe
+        # The script's own exit code is checked, and so is its final line:
+        # a test that stops early must never pass.
+        run: |
+          packaging/windows/e2e-service.ps1 -BinaryPath dist/tabtender-windows-amd64/tabtenderd.exe *>&1 | Tee-Object -FilePath e2e-service.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "e2e-service.ps1 exited with $code" }
+          if (-not (Select-String -Path e2e-service.log -Pattern 'ALL STEPS PASSED' -Quiet)) { throw 'e2e-service.ps1 did not run to completion' }
       - uses: actions/upload-artifact@v4
         with:
           name: tabtender-windows

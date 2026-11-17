@@ -515,6 +515,26 @@ func TestAttachTracksClients(t *testing.T) {
 	wantKind(t, err, KindNotFound)
 }
 
+func TestCDPClientsPerSessionAreBounded(t *testing.T) {
+	f := newFixture(t, nil)
+	s := f.mustCreate(t, CreateRequest{})
+	attachments := make([]*Attachment, 0, maxClientsPerSession)
+	for range maxClientsPerSession {
+		a, err := f.Attach(s.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attachments = append(attachments, a)
+	}
+	_, err := f.Attach(s.ID)
+	wantKind(t, err, KindCapacity)
+	// A client leaving makes room again.
+	attachments[0].Release()
+	if _, err := f.Attach(s.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSessionsExpireByTheWallClock(t *testing.T) {
 	f := newFixture(t, nil)
 	s := f.mustCreate(t, CreateRequest{TTLSeconds: ptr(3600)})

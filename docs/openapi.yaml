@@ -181,6 +181,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "429":
+          description: The session already has its maximum of 64 clients connected (`capacity_exceeded`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "502":
           description: The session's browser did not answer (`browser_unreachable`).
           content:

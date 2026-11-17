@@ -34,6 +34,14 @@ trap {
     exit 1
 }
 
+# Started below PowerShell 7 (for instance from a Command Prompt opened there),
+# Windows PowerShell inherits a module path that points at PowerShell 7's
+# modules and fails to load them. Drop those entries before any module loads.
+if ($PSVersionTable.PSEdition -ne 'Core') {
+    $env:PSModulePath = (@($env:PSModulePath -split ';' | Where-Object { $_ -and $_ -notmatch '(^|\\)PowerShell\\' }) +
+        "$PSHOME\Modules") -join ';'
+}
+
 $ServiceName = 'tabtenderd'
 $ServiceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
 

@@ -27,6 +27,10 @@ const (
 	tombstoneTTL           = 10 * time.Minute
 	maxTombstones          = 512
 	closeTimeout           = 30 * time.Second
+	// maxClientsPerSession bounds the CDP connections one session accepts.
+	// Each costs a browser-side CDP session; far more than any real use
+	// needs, it only stops a runaway client from piling them up.
+	maxClientsPerSession = 64
 )
 
 var profileNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
@@ -540,6 +544,9 @@ func (m *Manager) Attach(id string) (*Attachment, error) {
 	}
 	if e.session.Status != StatusRunning {
 		return nil, newError(KindNotRunning, "session %s is %s", id, e.session.Status)
+	}
+	if e.session.Clients >= maxClientsPerSession {
+		return nil, newError(KindCapacity, "session %s already has %d CDP clients connected", id, maxClientsPerSession)
 	}
 	e.session.Clients++
 	var once sync.Once

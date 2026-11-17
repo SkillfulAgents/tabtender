@@ -51,6 +51,7 @@ function Invoke-Wrapper {
 
 function Invoke-Native {
     param([string]$File, [string[]]$Arguments)
+    $ErrorActionPreference = 'Continue' # stderr output alone is not a failure
     $output = & $File @Arguments 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "FAIL: $File $($Arguments -join ' ') failed ($LASTEXITCODE): $output" }
     $output
@@ -110,46 +111,71 @@ function Remove-DataDir {
     }
 }
 
-function Write-Diagnostics {
-    $ErrorActionPreference = 'Continue'
-    Write-Host "`n--- service configuration ---"
-    & sc.exe qc tabtenderd
-    & sc.exe queryex tabtenderd
-    & sc.exe qfailure tabtenderd
-    & sc.exe qfailureflag tabtenderd
-    Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\tabtenderd' -ErrorAction SilentlyContinue |
-        Select-Object ImagePath, ObjectName, Start, Environment | Format-List | Out-String | Write-Host
-    Write-Host '--- permissions ---'
-    foreach ($path in $DataDir, $SecretsDir, $InstallDir, (Join-Path $InstallDir 'tabtenderd.exe')) {
-        if (Test-Path -LiteralPath $path) {
-            Write-Host "owner: $((Get-Acl -LiteralPath $path).Owner)"
-            & icacls.exe $path
-        } else {
-            Write-Host "$path does not exist"
-        }
+# Prints one block of diagnostics. Whatever goes wrong while collecting it is
+# noted and otherwise ignored: diagnostics must never mask the failure.
+function Write-Section {
+    param([string]$Title, [scriptblock]$Body)
+    Write-Host "--- $Title ---"
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $Body 2>&1 | Out-String -Stream | ForEach-Object { Write-Host $_ }
+    } catch {
+        Write-Host "(could not collect: $($_.Exception.Message))"
     }
-    Write-Host '--- data directory ---'
-    if (Test-Path -LiteralPath $DataDir) {
-        Get-ChildItem -LiteralPath $DataDir -Force -Recurse -Depth 1 -ErrorAction SilentlyContinue |
-            ForEach-Object { Write-Host $_.FullName }
-    }
-    Write-Host '--- service account profile ---'
-    Get-CimInstance Win32_UserProfile | Where-Object { $_.LocalPath -like '*tabtenderd*' } |
-        Select-Object LocalPath, SID, Loaded | Format-List | Out-String | Write-Host
-    Write-Host '--- tabtenderd and chrome processes ---'
-    Get-CimInstance Win32_Process -Filter "Name = 'tabtenderd.exe' OR Name = 'chrome.exe'" | ForEach-Object {
-        Write-Host "$($_.ProcessId) $(Get-ProcessAccount $_) $($_.Name)"
-    }
-    Write-Host '--- service events ---'
-    Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager' } -MaxEvents 300 -ErrorAction SilentlyContinue |
-        Where-Object { $_.Message -match 'Tabtender|tabtenderd' } | Select-Object -First 15 |
-        ForEach-Object { Write-Host "$($_.TimeCreated.ToString('s')) [$($_.Id)] $($_.Message)" }
-    Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'tabtenderd' } -MaxEvents 5 -ErrorAction SilentlyContinue |
-        ForEach-Object { Write-Host "$($_.TimeCreated.ToString('s')) $($_.Message)" }
-    Write-Host '--- service log tail ---'
-    if (Test-Path -LiteralPath $LogFile) { Get-Content -LiteralPath $LogFile -Tail 80 } else { Write-Host '(no log file)' }
 }
 
+function Write-Diagnostics {
+    Write-Section 'service configuration' {
+        & sc.exe qc tabtenderd
+        & sc.exe queryex tabtenderd
+        & sc.exe qfailure tabtenderd
+        & sc.exe qfailureflag tabtenderd
+        Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\tabtenderd' -ErrorAction SilentlyContinue |
+            Select-Object ImagePath, ObjectName, Start, Environment | Format-List
+    }
+    foreach ($path in $DataDir, $SecretsDir, $InstallDir, (Join-Path $InstallDir 'tabtenderd.exe')) {
+        Write-Section "permissions of $path" {
+            if (Test-Path -LiteralPath $path) {
+                "owner: $((Get-Acl -LiteralPath $path).Owner)"
+                & icacls.exe $path
+            } else {
+                'does not exist'
+            }
+        }
+    }
+    Write-Section 'data directory' {
+        if (Test-Path -LiteralPath $DataDir) {
+            Get-ChildItem -LiteralPath $DataDir -Force -Recurse -Depth 1 -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+        }
+    }
+    Write-Section 'service account profile' {
+        Get-CimInstance Win32_UserProfile | Where-Object { $_.LocalPath -like '*tabtenderd*' } |
+            Select-Object LocalPath, SID, Loaded | Format-List
+    }
+    Write-Section 'tabtenderd and chrome processes' {
+        Get-CimInstance Win32_Process -Filter "Name = 'tabtenderd.exe' OR Name = 'chrome.exe'" |
+            ForEach-Object { "$($_.ProcessId) $(Get-ProcessAccount $_) $($_.Name)" }
+    }
+    Write-Section 'Service Control Manager events' {
+        Get-WinEvent -LogName System -MaxEvents 500 -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -eq 'Service Control Manager' -and $_.Message -match 'Tabtender|tabtenderd' } |
+            Select-Object -First 15 | ForEach-Object { "$($_.TimeCreated.ToString('s')) [$($_.Id)] $($_.Message)" }
+    }
+    Write-Section 'tabtenderd events in the Application log' {
+        Get-WinEvent -LogName Application -MaxEvents 500 -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -eq 'tabtenderd' } |
+            Select-Object -First 5 | ForEach-Object { "$($_.TimeCreated.ToString('s')) $($_.Message)" }
+    }
+    Write-Section 'service log tail' {
+        if (Test-Path -LiteralPath $LogFile) { Get-Content -LiteralPath $LogFile -Tail 80 } else { '(no log file)' }
+    }
+}
+
+# The outcome is decided here and nowhere else: $failure stays set unless
+# every step ran to the end, and the script's last statement turns it into
+# the exit code. Diagnostics and cleanup run in between and cannot change it,
+# whatever they print, throw, or leave in $LASTEXITCODE.
+$failure = 'the test did not run to completion'
 try {
     Invoke-Wrapper $UninstallCmd @('-PurgeData') | Out-Null
     Remove-DataDir
@@ -345,12 +371,27 @@ sessions:
     Assert (-not (Test-Path $InstallDir)) 'the install directory was left behind'
     Assert (@(Get-SessionBrowsers).Count -eq 0) 'browsers were left running'
 
-    Write-Host "`nPASS: Windows service lifecycle"
+    $failure = $null
 } catch {
-    Write-Host "`n$_"
-    Write-Diagnostics
-    throw
-} finally {
-    $ErrorActionPreference = 'Continue'
-    & $UninstallCmd -PurgeData
+    $failure = "$_`n$($_.ScriptStackTrace)"
 }
+
+if ($failure) {
+    Write-Host "`n$failure`n"
+    try { Write-Diagnostics } catch { Write-Host "(diagnostics failed: $($_.Exception.Message))" }
+}
+
+Write-Host "`n==> Cleanup"
+try {
+    $ErrorActionPreference = 'Continue'
+    & $UninstallCmd -PurgeData 2>&1 | ForEach-Object { Write-Host "$_" }
+} catch {
+    Write-Host "(cleanup failed: $($_.Exception.Message))"
+}
+
+if ($failure) {
+    Write-Host "`nE2E FAILED: $failure"
+    exit 1
+}
+Write-Host "`nALL STEPS PASSED: Windows service lifecycle"
+exit 0

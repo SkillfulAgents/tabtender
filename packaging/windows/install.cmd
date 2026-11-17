@@ -6,6 +6,10 @@ rem from the internet, so PowerShell's default execution policy refuses to run
 rem them. This wrapper lifts the policy for this one invocation only.
 setlocal
 
+rem When this is started from PowerShell 7, PSModulePath points at its modules,
+rem which Windows PowerShell cannot load. Cleared, it is rebuilt from defaults.
+set "PSModulePath="
+
 rem fltmc succeeds only in an elevated process.
 "%SystemRoot%\System32\fltmc.exe" >nul 2>&1
 if errorlevel 1 (
