@@ -91,6 +91,11 @@ func launchArgs(opts runtime.BrowserOptions, transport, extra []string) []string
 	)
 	if opts.Headless {
 		args = append(args, "--headless=new")
+	} else {
+		// Chrome stops drawing a window that another window covers, and a
+		// CDP screencast of its pages then gets no frames. Sessions are
+		// watched remotely, so their windows are usually covered.
+		args = append(args, "--disable-backgrounding-occluded-windows")
 	}
 	args = append(args, extra...)
 	return append(args, "about:blank")

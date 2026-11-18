@@ -21,6 +21,10 @@ func TestLaunchArgs(t *testing.T) {
 	if !slices.Contains(headed, "--user-data-dir=/profiles/a") || !slices.Contains(headed, "--remote-debugging-pipe") {
 		t.Fatalf("args = %v", headed)
 	}
+	// A covered window must keep drawing, or a screencast of it freezes.
+	if !slices.Contains(headed, "--disable-backgrounding-occluded-windows") {
+		t.Fatalf("headed launch lets a covered window stop drawing: %v", headed)
+	}
 	for _, arg := range headed {
 		if strings.HasPrefix(arg, "--headless") {
 			t.Fatalf("headed launch carries %s", arg)

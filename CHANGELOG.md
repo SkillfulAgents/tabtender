@@ -19,6 +19,8 @@ The first version intended for use outside development.
   authenticated endpoint, and browsers exit with the service.
 - Every CDP connection is independent; several clients can share a session.
 - Sessions expire by the wall clock, also across system sleep.
+- Headed browsers keep drawing while another window covers theirs, so a CDP
+  screencast of a session does not freeze.
 
 ### Service
 
