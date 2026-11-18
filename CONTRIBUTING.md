@@ -41,5 +41,33 @@ for CI; run them locally only on a machine where that is acceptable.
 - Secrets never reach logs, URLs other than a session's `cdpUrl`, or child
   processes.
 
+## Releasing
+
+Pushing a version tag on a commit of `main` runs the
+[Release workflow](.github/workflows/release.yml): the full CI suite, then
+signed builds, then a GitHub release with `Tabtender.dmg`, the two Windows
+archives, and `SHA256SUMS`.
+
+```sh
+git tag v0.1.0-rc.1 && git push origin v0.1.0-rc.1   # a pre-release
+git tag v0.1.0 && git push origin v0.1.0             # a release; becomes "latest"
+```
+
+Move the "Unreleased" notes in `CHANGELOG.md` under the new version first.
+Running the workflow by hand (**Actions → Release → Run workflow**) is a
+rehearsal: the same builds, kept as workflow artifacts, nothing published.
+
+A tag is never published unsigned; the workflow fails early when one of these
+repository secrets is missing:
+
+| Secret | What it is |
+| --- | --- |
+| `CSC_LINK` | The Developer ID Application certificate with its private key, as a base64-encoded `.p12` |
+| `CSC_KEY_PASSWORD` | The password of that `.p12` |
+| `APPLE_API_KEY` | An App Store Connect API key for notarization, as a base64-encoded `.p8` |
+| `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` | That key's ID and its issuer ID |
+| `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` | An app registration allowed to sign with the Azure Artifact Signing account |
+| `AZURE_CODE_SIGNING_ENDPOINT`, `AZURE_CODE_SIGNING_ACCOUNT`, `AZURE_CODE_SIGNING_PROFILE` | The signing account's endpoint URL, its name, and the certificate profile |
+
 By contributing you agree that your contribution is licensed under the
 project's [MIT license](LICENSE).

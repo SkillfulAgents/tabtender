@@ -35,7 +35,6 @@ The first version intended for use outside development.
 
 ### Known limitations
 
-- macOS builds are not notarized; see the README for the one-time step.
 - Sessions are not sandboxed: controlling a browser over CDP includes file
   access as the service's user.
 - Linux builds and passes CI but is not a packaged release target.

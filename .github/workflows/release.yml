@@ -1,0 +1,255 @@
+name: Release
+
+# Pushing a version tag builds, signs, and publishes a release:
+#
+#   v0.1.0-rc.1  ->  a pre-release
+#   v0.1.0       ->  a release, which becomes the repository's "latest"
+#
+# Running the workflow by hand is a rehearsal: it builds the same artifacts
+# (signed when the signing secrets are there) and keeps them as workflow
+# artifacts without publishing anything.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      publish: ${{ steps.version.outputs.publish }}
+      sign_macos: ${{ steps.signing.outputs.macos }}
+      sign_windows: ${{ steps.signing.outputs.windows }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Version
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "version=0.0.0-dev.$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta|alpha)\.[0-9]+)?$ ]]; then
+            echo "::error::$GITHUB_REF_NAME is not a release tag. Use vX.Y.Z, or vX.Y.Z-rc.N for a pre-release."
+            exit 1
+          fi
+          # A release is cut from what is on main, never from a side branch.
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME points at a commit that is not on main."
+            exit 1
+          fi
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          case "$GITHUB_REF_NAME" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+      # A published release is always signed: a tag fails here when a secret
+      # is missing. A rehearsal signs what it has the secrets for.
+      - name: Signing secrets
+        id: signing
+        env:
+          MACOS: ${{ secrets.CSC_LINK != '' && secrets.CSC_KEY_PASSWORD != '' && secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER != '' }}
+          WINDOWS: ${{ secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_CODE_SIGNING_ENDPOINT != '' && secrets.AZURE_CODE_SIGNING_ACCOUNT != '' && secrets.AZURE_CODE_SIGNING_PROFILE != '' }}
+          PUBLISH: ${{ steps.version.outputs.publish }}
+        run: |
+          echo "macos=$MACOS" >> "$GITHUB_OUTPUT"
+          echo "windows=$WINDOWS" >> "$GITHUB_OUTPUT"
+          echo "macOS signing and notarization: $MACOS"
+          echo "Windows signing: $WINDOWS"
+          if [ "$PUBLISH" = true ] && { [ "$MACOS" != true ] || [ "$WINDOWS" != true ]; }; then
+            echo "::error::Signing secrets are missing; a release is never published unsigned. See CONTRIBUTING.md."
+            exit 1
+          fi
+
+  # The whole test suite, on the commit being released.
+  verify:
+    name: Verify
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+
+  build-mac:
+    name: Build macOS app
+    needs: prepare
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # The Developer ID certificate goes into a keychain of its own that
+      # only lives as long as the runner.
+      - name: Import the signing certificate
+        if: needs.prepare.outputs.sign_macos == 'true'
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(uuidgen)"
+          printf '%s' "$CSC_LINK" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -f pkcs12 -P "$CSC_KEY_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/certificate.p12"
+
+          identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -n 1)"
+          if [ -z "$identity" ]; then
+            echo "::error::CSC_LINK holds no Developer ID Application certificate."
+            exit 1
+          fi
+          echo "Signing as $identity"
+
+          printf '%s' "$APPLE_API_KEY" | base64 --decode > "$RUNNER_TEMP/notary-key.p8"
+          {
+            echo "CODESIGN_IDENTITY=$identity"
+            echo "NOTARY_KEY=$RUNNER_TEMP/notary-key.p8"
+          } >> "$GITHUB_ENV"
+      - name: Build, sign, and notarize Tabtender.app and its disk image
+        env:
+          NOTARY_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          packaging/macos/build-app.sh --dmg
+          mv "dist/Tabtender-$VERSION.dmg" dist/Tabtender.dmg
+      # What a user's Mac will decide when they open the download.
+      - name: Check that Gatekeeper accepts the download
+        if: needs.prepare.outputs.sign_macos == 'true'
+        run: |
+          xcrun stapler validate dist/Tabtender.dmg
+          spctl --assess --type open --context context:primary-signature --verbose=2 dist/Tabtender.dmg
+          mount="$(mktemp -d)"
+          hdiutil attach -quiet -nobrowse -readonly -mountpoint "$mount" dist/Tabtender.dmg
+          trap 'hdiutil detach -quiet "$mount"' EXIT
+          codesign --verify --deep --strict --verbose=2 "$mount/Tabtender.app"
+          xcrun stapler validate "$mount/Tabtender.app"
+          spctl --assess --type execute --verbose=2 "$mount/Tabtender.app"
+          "$mount/Tabtender.app/Contents/MacOS/tabtenderd" version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-release-artifacts
+          path: dist/Tabtender.dmg
+          if-no-files-found: error
+          retention-days: 5
+          compression-level: 0
+
+  build-win:
+    name: Build Windows service
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build tabtenderd.exe
+        shell: pwsh
+        run: packaging/windows/package.ps1 -Version '${{ needs.prepare.outputs.version }}' -Step Build
+      - name: Sign tabtenderd.exe
+        if: needs.prepare.outputs.sign_windows == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_CODE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_CODE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CODE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: exe
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: Check the signatures
+        if: needs.prepare.outputs.sign_windows == 'true'
+        shell: pwsh
+        run: |
+          $executables = Get-ChildItem dist -Recurse -Filter tabtenderd.exe
+          if ($executables.Count -ne 2) { throw "expected 2 executables, found $($executables.Count)" }
+          foreach ($executable in $executables) {
+            $signature = Get-AuthenticodeSignature $executable.FullName
+            Write-Host "$($executable.FullName): $($signature.Status), $($signature.SignerCertificate.Subject)"
+            if ($signature.Status -ne 'Valid') { throw "$($executable.FullName) is not validly signed" }
+            if (-not $signature.TimeStamperCertificate) { throw "$($executable.FullName) has no timestamp" }
+          }
+      - name: Archive
+        shell: pwsh
+        run: |
+          packaging/windows/package.ps1 -Version '${{ needs.prepare.outputs.version }}' -Step Archive
+          dist/tabtender-windows-amd64/tabtenderd.exe version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-release-artifacts
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 5
+          compression-level: 0
+
+  create-release:
+    name: Publish GitHub release
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [prepare, verify, build-mac, build-win]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-release-artifacts"
+          merge-multiple: true
+          path: release
+      - name: Checksums
+        working-directory: release
+        run: sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      # A draft first, so the release never shows up with files missing. A
+      # re-run picks the draft up again and replaces what it holds.
+      - name: Create the draft
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            exit 0
+          fi
+          flags=(--draft --verify-tag --generate-notes --title "Tabtender $VERSION")
+          if [ "$PRERELEASE" = true ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "${flags[@]}"
+      - name: Upload the files
+        run: gh release upload "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --clobber
+      # Only a full release becomes "latest", which is what the README's
+      # download links point at.
+      - name: Publish
+        run: |
+          if [ "$PRERELEASE" = true ]; then
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
+          else
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi

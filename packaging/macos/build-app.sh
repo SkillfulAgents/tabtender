@@ -12,8 +12,13 @@
 #   VERSION            version string (default: git describe, or "dev")
 #   CODESIGN_IDENTITY  signing identity (default "-": ad-hoc). Use a
 #                      "Developer ID Application: ..." identity for releases.
-#   NOTARY_PROFILE     notarytool keychain profile; when set (with --dmg and a
-#                      Developer ID identity) the DMG is notarized and stapled.
+#   NOTARY_PROFILE     notarytool keychain profile; when set (with a Developer
+#                      ID identity) the app and the DMG are notarized and
+#                      stapled.
+#   NOTARY_KEY, NOTARY_KEY_ID, NOTARY_ISSUER
+#                      the same with an App Store Connect API key instead of
+#                      a keychain profile: path of the .p8 file, its key ID,
+#                      and the issuer ID.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -36,6 +41,33 @@ VERSION="${VERSION#v}"
 BUILD_NUMBER="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 1)"
 IDENTITY="${CODESIGN_IDENTITY:--}"
 LDFLAGS="-s -w -X github.com/SkillfulAgents/tabtender/internal/version.Version=$VERSION"
+
+NOTARY_AUTH=()
+if [ -n "${NOTARY_PROFILE:-}" ]; then
+	NOTARY_AUTH=(--keychain-profile "$NOTARY_PROFILE")
+elif [ -n "${NOTARY_KEY:-}" ]; then
+	NOTARY_AUTH=(--key "$NOTARY_KEY" --key-id "${NOTARY_KEY_ID:?}" --issuer "${NOTARY_ISSUER:?}")
+fi
+if [ "${#NOTARY_AUTH[@]}" -gt 0 ] && [ "$IDENTITY" = "-" ]; then
+	echo "notarization needs CODESIGN_IDENTITY set to a Developer ID identity" >&2
+	exit 2
+fi
+
+# Submits a file to Apple's notary service and fails unless it is accepted.
+notarize() { # file
+	local result id status
+	result="$(xcrun notarytool submit "$1" "${NOTARY_AUTH[@]}" --wait --output-format json)" || {
+		echo "$result" >&2
+		return 1
+	}
+	id="$(plutil -extract id raw -o - - <<<"$result")"
+	status="$(plutil -extract status raw -o - - <<<"$result")"
+	echo "    notarization $id: $status"
+	if [ "$status" != "Accepted" ]; then
+		xcrun notarytool log "$id" "${NOTARY_AUTH[@]}" >&2 || true
+		return 1
+	fi
+}
 
 echo "==> Building Tabtender $VERSION"
 rm -rf "$APP"
@@ -81,6 +113,15 @@ codesign "${SIGN_FLAGS[@]}" --identifier com.skillfulagents.tabtender.daemon "$A
 codesign "${SIGN_FLAGS[@]}" "$APP"
 codesign --verify --strict "$APP"
 
+# The app carries its own ticket, so it opens on a Mac that is offline the
+# first time, also after it has been copied out of the disk image.
+if [ "${#NOTARY_AUTH[@]}" -gt 0 ]; then
+	echo "==> Notarizing the app"
+	ditto -c -k --keepParent "$APP" "$DIST/build/Tabtender.zip"
+	notarize "$DIST/build/Tabtender.zip"
+	xcrun stapler staple "$APP"
+fi
+
 echo "==> $APP"
 
 if [ "$MAKE_DMG" = 1 ]; then
@@ -93,9 +134,9 @@ if [ "$MAKE_DMG" = 1 ]; then
 	hdiutil create -quiet -volname "Tabtender" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
 	if [ "$IDENTITY" != "-" ]; then
 		codesign --force --sign "$IDENTITY" --timestamp "$DMG"
-		if [ -n "${NOTARY_PROFILE:-}" ]; then
-			echo "==> Notarizing"
-			xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+		if [ "${#NOTARY_AUTH[@]}" -gt 0 ]; then
+			echo "==> Notarizing the disk image"
+			notarize "$DMG"
 			xcrun stapler staple "$DMG"
 		fi
 	fi

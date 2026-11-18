@@ -3,15 +3,16 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+  # The release workflow runs all of this before it publishes anything.
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -135,20 +136,7 @@ jobs:
           node-version: 22
       - name: Build and package tabtenderd.exe
         shell: pwsh
-        run: |
-          $version = (git describe --tags --always).TrimStart('v')
-          $ldflags = "-s -w -X github.com/SkillfulAgents/tabtender/internal/version.Version=$version"
-          foreach ($arch in 'amd64', 'arm64') {
-            $dir = "dist/tabtender-windows-$arch"
-            New-Item -ItemType Directory -Force -Path $dir | Out-Null
-            $env:GOARCH = $arch
-            go build -trimpath -ldflags $ldflags -o "$dir/tabtenderd.exe" ./cmd/tabtenderd
-            if ($LASTEXITCODE -ne 0) { throw "build failed for $arch" }
-            Copy-Item packaging/windows/install.ps1, packaging/windows/install.cmd, packaging/windows/uninstall.ps1, packaging/windows/uninstall.cmd, LICENSE -Destination $dir
-            bash packaging/third-party-notices.sh "$dir/THIRD_PARTY_NOTICES.txt"
-            if ($LASTEXITCODE -ne 0) { throw "collecting license notices failed" }
-            Compress-Archive -Path "$dir/*" -DestinationPath "dist/tabtender-$version-windows-$arch.zip"
-          }
+        run: packaging/windows/package.ps1 -Version (git describe --tags --always).TrimStart('v')
       - name: Install client test dependencies
         working-directory: test/clients
         run: npm ci
@@ -166,28 +154,3 @@ jobs:
           name: tabtender-windows
           path: dist/*.zip
           if-no-files-found: error
-
-  release:
-    name: Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [lint, test, macos-app, windows-service]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-      - name: Checksums
-        working-directory: artifacts
-        run: sha256sum -- * > SHA256SUMS && cat SHA256SUMS
-      - name: Publish GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        # A version with a suffix (v0.1.0-beta.1) is published as a
-        # pre-release, so it never becomes the repository's "latest".
-        run: |
-          flags=(--generate-notes --verify-tag)
-          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease) ;; esac
-          gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" "${flags[@]}"

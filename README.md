@@ -1,6 +1,17 @@
+<p align="center">
+  <img src="docs/assets/logo.png" alt="Tabtender" width="240">
+</p>
+
 # Tabtender
 
 [![CI](https://github.com/SkillfulAgents/tabtender/actions/workflows/ci.yml/badge.svg)](https://github.com/SkillfulAgents/tabtender/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/SkillfulAgents/tabtender)](https://github.com/SkillfulAgents/tabtender/releases/latest)
+
+**Download the latest release:**
+[macOS](https://github.com/SkillfulAgents/tabtender/releases/latest/download/Tabtender.dmg) ·
+[Windows x64](https://github.com/SkillfulAgents/tabtender/releases/latest/download/tabtender-windows-amd64.zip) ·
+[Windows ARM64](https://github.com/SkillfulAgents/tabtender/releases/latest/download/tabtender-windows-arm64.zip) ·
+[all releases and pre-releases](https://github.com/SkillfulAgents/tabtender/releases)
 
 Tabtender is an open-source browser session server. It runs **native browser
 processes** on macOS and Windows — no Docker — and exposes each one to remote
@@ -27,20 +38,14 @@ authenticated HTTP/WebSocket endpoint.
 
 ### macOS
 
-1. Download `Tabtender-<version>.dmg` from the
-   [releases page](https://github.com/SkillfulAgents/tabtender/releases) and
-   drag **Tabtender** to Applications. Google Chrome must be installed.
-2. Beta builds are not notarized yet, so macOS refuses to open a downloaded
-   copy. Clear the download flag once, in Terminal:
-
-   ```sh
-   xattr -dr com.apple.quarantine /Applications/Tabtender.app
-   ```
-
-3. Open Tabtender from Applications. A menu-bar icon appears, and the app
+1. Download
+   [`Tabtender.dmg`](https://github.com/SkillfulAgents/tabtender/releases/latest/download/Tabtender.dmg)
+   (a universal build, signed and notarized), open it, and drag **Tabtender**
+   to Applications. Google Chrome must be installed.
+2. Open Tabtender from Applications. A menu-bar icon appears, and the app
    registers and starts the `tabtenderd` background service (a per-user
    launchd agent — no root). macOS announces the new background item.
-4. Open **Settings → API Key** to copy your key.
+3. Open **Settings → API Key** to copy your key.
 
 Open the app from the Applications folder, not from the disk image: the
 service is registered at the app's location, so the app declines to set it up
@@ -80,7 +85,10 @@ that is taken).
 
 ### Windows
 
-Download and extract `tabtender-<version>-windows-<arch>.zip`, then from an
+Download and extract
+[`tabtender-windows-amd64.zip`](https://github.com/SkillfulAgents/tabtender/releases/latest/download/tabtender-windows-amd64.zip)
+(or [`-arm64`](https://github.com/SkillfulAgents/tabtender/releases/latest/download/tabtender-windows-arm64.zip)),
+then from an
 elevated Command Prompt or PowerShell window in that folder:
 
 ```powershell
@@ -429,12 +437,16 @@ make clients    # Playwright + Puppeteer suite
 make app        # dist/Tabtender.app and DMG (macOS, universal)
 ```
 
-Sign and notarize a macOS release with your own identity:
+Sign and notarize a macOS build with your own identity:
 
 ```sh
 CODESIGN_IDENTITY="Developer ID Application: Example (TEAMID)" NOTARY_PROFILE=my-profile \
   packaging/macos/build-app.sh --dmg
 ```
+
+Releases are built, signed, and published by the
+[Release workflow](.github/workflows/release.yml) when a version tag is
+pushed; see [CONTRIBUTING.md](CONTRIBUTING.md#releasing).
 
 End-to-end tests honor `TABTENDER_CHROME_PATH`, `TABTENDER_E2E_HEADED=1`,
 `TABTENDER_E2E_TUNNEL=1` (real Cloudflare Quick Tunnel), and
