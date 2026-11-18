@@ -71,14 +71,7 @@ service to the exact build that registered it, so the app registers the
 service again when it finds an older daemon running or launchd refusing to
 start the new one (this restarts the service and ends its sessions).
 
-**Uninstalling.** In the app, choose **Settings → General → Unregister**
-(this stops the service), quit the app, and move it to the Trash. Your data
-stays in `~/Library/Application Support/Tabtender` (configuration, named
-profiles, logs), the API key in the login Keychain (item
-`com.skillfulagents.tabtender`), and the app's own preferences
-(`defaults delete com.skillfulagents.tabtender`); delete all three to remove
-every trace. With the preferences left behind, a later install does not
-register the service by itself: choose **Register** in the app.
+**Uninstalling.** See [Uninstalling](#uninstalling).
 
 If the service does not start, look at
 `~/Library/Application Support/Tabtender/logs/`: `tabtenderd.log` is the
@@ -111,9 +104,8 @@ Administrators. To supply your own key instead, use
 `.\install.cmd -ApiKey <key>`.
 
 To upgrade, extract the new zip and run `.\install.cmd` again: the API key,
-configuration, and browser profiles are kept. `.\uninstall.cmd` removes the
-service and keeps the data; `.\uninstall.cmd -PurgeData` also deletes the data
-directory, including the API key and all profiles.
+configuration, and browser profiles are kept. To remove it, see
+[Uninstalling](#uninstalling).
 
 A Windows Service runs in the non-interactive session 0, so sessions are
 **headless** there. For headed browsers, stop the service and run
@@ -135,6 +127,45 @@ curl --unix-socket ~/.local/share/tabtender/tabtenderd.sock http://tabtender/mgm
 ```
 
 Or pin a key of your own (at least 32 characters): `TABTENDER_API_KEY=... go run ./cmd/tabtenderd`.
+
+## Uninstalling
+
+### macOS
+
+1. In the app, choose **Settings → General → Unregister**. This stops the
+   background service and ends its sessions.
+2. Quit the app (**Quit** in the menu-bar popover).
+3. Move `/Applications/Tabtender.app` to the Trash.
+
+Do the first step before deleting the app. If the app is already gone and
+macOS still lists the background item, remove it under **System Settings →
+General → Login Items & Extensions**.
+
+This keeps your data, so installing again picks up the same API key,
+configuration, and profiles. To remove every trace as well:
+
+```sh
+# Configuration, named browser profiles, and logs
+rm -rf ~/Library/Application\ Support/Tabtender
+
+# The API key and, if you set one, the Cloudflare tunnel token (login Keychain)
+security delete-generic-password -s com.skillfulagents.tabtender -a api-key
+security delete-generic-password -s com.skillfulagents.tabtender -a cloudflare-tunnel-token
+
+# The app's own preferences. Left behind, they make a later install wait for
+# you to choose Register instead of setting the service up by itself.
+defaults delete com.skillfulagents.tabtender
+```
+
+### Windows
+
+From an elevated Command Prompt or PowerShell window in the folder you
+installed from:
+
+```powershell
+.\uninstall.cmd              # removes the service, keeps the data
+.\uninstall.cmd -PurgeData   # also deletes %ProgramData%\Tabtender: the API key, configuration, and profiles
+```
 
 ## Using it
 
