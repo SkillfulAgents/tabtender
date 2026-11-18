@@ -235,7 +235,9 @@ try {
     Assert ($created.Json.headless -eq $true) 'a Windows Service session must be headless'
     $browsers = @(Get-SessionBrowsers)
     Assert ($browsers.Count -ge 1) 'no chrome.exe process found for the session'
-    $accounts = @($browsers | ForEach-Object { Get-ProcessAccount $_ } | Sort-Object -Unique)
+    # Chrome starts helper processes that live for a moment only; one that
+    # exited after it was listed has no owner to report.
+    $accounts = @($browsers | ForEach-Object { try { Get-ProcessAccount $_ } catch { } } | Sort-Object -Unique)
     Assert ("$accounts" -eq $ServiceAccount) "browsers run as: $($accounts -join ', ')"
     $headed = Invoke-Api -Method POST -Url "$url/v1/sessions" -Key $key -Body '{"headless": false}'
     Assert ($headed.Status -eq 400) "a headed session request returned $($headed.Status), want 400"
