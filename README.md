@@ -74,8 +74,11 @@ start the new one (this restarts the service and ends its sessions).
 **Uninstalling.** In the app, choose **Settings → General → Unregister**
 (this stops the service), quit the app, and move it to the Trash. Your data
 stays in `~/Library/Application Support/Tabtender` (configuration, named
-profiles, logs) and the API key in the login Keychain (item
-`com.skillfulagents.tabtender`); delete both to remove every trace.
+profiles, logs), the API key in the login Keychain (item
+`com.skillfulagents.tabtender`), and the app's own preferences
+(`defaults delete com.skillfulagents.tabtender`); delete all three to remove
+every trace. With the preferences left behind, a later install does not
+register the service by itself: choose **Register** in the app.
 
 If the service does not start, look at
 `~/Library/Application Support/Tabtender/logs/`: `tabtenderd.log` is the
