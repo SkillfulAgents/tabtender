@@ -88,6 +88,10 @@ func launchArgs(opts runtime.BrowserOptions, transport, extra []string) []string
 		// the OS keychain on every fresh profile.
 		"--password-store=basic",
 		"--use-mock-keychain",
+		// Chrome turns AutomationControlled on for a browser driven through
+		// the debugging pipe, and pages then read navigator.webdriver as
+		// true. A browser started with a fixed debugging port reads false.
+		"--disable-blink-features=AutomationControlled",
 	)
 	if opts.Headless {
 		args = append(args, "--headless=new")
