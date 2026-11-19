@@ -21,6 +21,8 @@ The first version intended for use outside development.
 - Sessions expire by the wall clock, also across system sleep.
 - Headed browsers keep drawing while another window covers theirs, so a CDP
   screencast of a session does not freeze.
+- Pages in a session read `navigator.webdriver` as `false`, as in a browser
+  that nothing drives.
 
 ### Service
 

@@ -38,6 +38,12 @@ func TestLaunchArgs(t *testing.T) {
 	if !slices.Contains(headless, "--headless=new") || !slices.Contains(headless, "--no-sandbox") {
 		t.Fatalf("args = %v", headless)
 	}
+	// The debugging pipe would make pages read navigator.webdriver as true.
+	for _, args := range [][]string{headed, headless} {
+		if !slices.Contains(args, "--disable-blink-features=AutomationControlled") {
+			t.Fatalf("launch reports the browser to pages as automated: %v", args)
+		}
+	}
 	if headless[len(headless)-1] != "about:blank" {
 		t.Fatalf("the start URL must come last: %v", headless)
 	}

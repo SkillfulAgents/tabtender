@@ -226,6 +226,17 @@ func TestBrowsersOpenNoDebuggingPort(t *testing.T) {
 	}
 }
 
+// Chrome marks a browser driven through the debugging pipe as automated;
+// pages in a session must not see that mark.
+func TestPagesDoNotSeeAnAutomatedBrowser(t *testing.T) {
+	d := newSpec(t).start(t)
+	client := d.connect(d.createSession(""))
+	target := client.openPage("about:blank")
+	if got := client.evaluate(target, `navigator.webdriver`); got != "false" {
+		t.Fatalf("navigator.webdriver = %s", got)
+	}
+}
+
 // Browsers are tied to the daemon through their debugging pipe: when the
 // daemon dies without a chance to clean up, they exit by themselves.
 func TestBrowsersDoNotOutliveAKilledDaemon(t *testing.T) {
@@ -744,6 +755,9 @@ func TestHeadedSession(t *testing.T) {
 	// A real window has non-zero outer dimensions.
 	if got := client.evaluate(target, `window.outerWidth > 0 && window.outerHeight > 0`); got != "true" {
 		t.Fatalf("window dimensions check = %s", got)
+	}
+	if got := client.evaluate(target, `navigator.webdriver`); got != "false" {
+		t.Fatalf("navigator.webdriver = %s in a headed session", got)
 	}
 	var window struct {
 		Bounds struct {
